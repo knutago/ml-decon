@@ -1,0 +1,13 @@
+[project]
+name = "ml-decon"
+version = "0.1.0"
+description = "Machine-learning deconvolution of astronomical images"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "astropy>=8.0.0",
+    "matplotlib>=3.11.0",
+    "numpy>=2.4.0",
+    "pyyaml>=6.0.3",
+    "torch>=2.12.1",
+]
