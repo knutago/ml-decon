@@ -19,7 +19,7 @@ import csv
 import json
 import sys
 from pathlib import Path
-
+from scipy.stats import theilslopes
 import numpy as np
 from astropy.io import fits
 
@@ -64,6 +64,26 @@ def cut_patches(image, corners, patch_size):
         patches[index, 0] = image[y:y + patch_size, x:x + patch_size]
     return patches
 
+def fit_affine_photometry(observed, ideal, block=128, margin=64):
+    """Fit observed ≈ gain * ideal + sky using block means.
+
+    margin trims the border so PSF flux leaking off the frame doesn't
+    bias the gain. Returns (gain, sky) in observed image units.
+    """
+    obs = observed[margin:-margin, margin:-margin]
+    idl = ideal[margin:-margin, margin:-margin]
+
+    h = (obs.shape[0] // block) * block
+    w = (obs.shape[1] // block) * block
+    obs = obs[:h, :w].reshape(h // block, block, w // block, block)
+    idl = idl[:h, :w].reshape(h // block, block, w // block, block)
+
+    obs_mean = np.nanmean(obs, axis=(1, 3)).ravel()
+    idl_mean = np.nanmean(idl, axis=(1, 3)).ravel()
+
+    good = np.isfinite(obs_mean) & np.isfinite(idl_mean)
+    gain, sky, lo, hi = theilslopes(obs_mean[good], idl_mean[good])
+    return gain, sky, (lo, hi)
 
 def main(config_path):
     config = load_config(config_path)
@@ -79,6 +99,10 @@ def main(config_path):
     if observed_image.shape != ideal_image.shape:
         raise ValueError(f"observed {observed_image.shape} and ideal {ideal_image.shape} "
                          "FITS must share a pixel grid")
+    gain, sky, ci = fit_affine_photometry(observed_image, ideal_image,
+                                      block=data.patch_size,
+                                      margin=4 * data.patch_size)
+    observed_image = (observed_image - sky) / gain
     height, width = observed_image.shape
 
     patch_size = data.patch_size
