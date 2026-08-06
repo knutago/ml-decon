@@ -97,9 +97,6 @@ def main(config_path):
     ideal_image = load_fits(data.ideal_fits) 
 =======
     ideal_image = load_fits(data.ideal_fits)
-    scale = observed_image.sum()/ideal_image.sum() #compute scale flux difference between ideal and observed iamges
-    observed_image /= scale #s cale so that total flux is same between ideal and observed before patches
->>>>>>> 455f8d657329326eb0be957f12032cc864490261
     if observed_image.shape != ideal_image.shape:
         raise ValueError(f"observed {observed_image.shape} and ideal {ideal_image.shape} "
                          "FITS must share a pixel grid")
