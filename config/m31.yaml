@@ -1,0 +1,12 @@
+seed: 0
+data:
+  observed_fits: data/m31bK50_trim.fits
+  ideal_fits:    data/m31bK50.fits
+  out_dir:       data/m31bK50
+  patch_size:    64
+  stride:        32
+  split_block_size: 512
+  val_fraction:  0.1
+  observed_normalize: asinh
+  ideal_normalize:    asinh
+  asinh_softening:    1.0
