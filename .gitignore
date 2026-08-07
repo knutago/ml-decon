@@ -95,3 +95,11 @@ Icon
 Network Trash Folder
 Temporary Items
 .apdisk
+
+# Science data (CLAUDE.md: data never enters the repo). repro_table.csv is a small
+# derived summary (scale/sky constants), versioned deliberately -- not bulk data.
+*.fits
+*.npy
+*.pt
+*.pth
+*.png
