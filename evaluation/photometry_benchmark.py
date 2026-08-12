@@ -8,7 +8,11 @@ in MAGNITUDE BINS. Steps are numbered as specified:
   0. Benchmark dataset: patch size is measured and reported.
   1. Measure the flux scaling between the blurry input and the sharp truth
      BEFORE trusting any photometry (--check-scaling, on by default).
-  2. Detection threshold: --nsigma above the sigma-clipped sky.
+  2. Detection threshold: --nsigma above the sigma-clipped sky. By default the
+     cut is taken from the TRUTH image and applied to every method, so all are
+     compared at matched depth (--no-common-threshold for each image's own).
+     The threshold sets DEPTH only; box fluxes are still background-subtracted
+     with each image's own sky.
   3. Identify pixels above that threshold.
   4. For each, flux = total value in a 3x3 box centred on it. A pixel counts as
      a peak only if it is the maximum of its own 3x3 neighbourhood, so fainter
@@ -224,9 +228,19 @@ def run_catalogue(recon, truth, nsigma, box, edge, radius, truth_nsigma=None,
     for k in range(len(truth)):
         ip, ifx = detect_and_measure(truth[k], tn, edge, box)
         if common_threshold:
-            # Same absolute cut for every method: the TRUTH's sky + nsigma*std.
+            # TWO DIFFERENT JOBS, and they must not share a sky value:
+            #   detection DEPTH  -> the truth's absolute cut, so every method
+            #                       is thresholded at the same physical flux
+            #   background SUBTRACTION -> each image's OWN sky, because that is
+            #                       the pedestal actually present in it
+            # Using the truth's sky for both over-subtracts any method whose
+            # background sits lower. L1's sky is 0.0 against the truth's
+            # 0.0064, so a shared sky removes 0.0064*9 = 0.058 from every box
+            # -- the entire flux of a faint source -- and its flux ratio falls
+            # to 0.586 for reasons that have nothing to do with deconvolution.
             sky_t, sig_t = sky_stats(truth[k])
-            mp, mfx = detect_at(recon[k], sky_t + nsigma * sig_t, sky_t,
+            sky_r, _ = sky_stats(recon[k])
+            mp, mfx = detect_at(recon[k], sky_t + nsigma * sig_t, sky_r,
                                 edge, box)
         else:
             mp, mfx = detect_and_measure(recon[k], nsigma, edge, box)
@@ -316,16 +330,21 @@ def main():
                    help="border excluded from detection. 64x64 patches carry a "
                         "31x31 PSF, so sources near the edge are boundary "
                         "contaminated for every method.")
-    p.add_argument("--common-threshold", action="store_true",
-                   help="detect every method at the TRUTH's absolute threshold "
-                        "(sky + nsigma*sigma measured on the truth patch) "
-                        "instead of each image's own. Off by default because "
-                        "the specified procedure says 'N sigma above sky', "
-                        "which reads as per-image. Turn it ON to compare "
-                        "methods at matched DEPTH: per-image thresholds give a "
-                        "sparse solver a 1.57 mag deeper cut for free, which "
-                        "flatters its completeness and inflates its spurious "
-                        "rate at the same time.")
+    p.add_argument("--common-threshold", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="ON BY DEFAULT. Detect every method at the TRUTH's "
+                        "absolute cut (truth sky + nsigma*truth sigma) rather "
+                        "than each image's own, so all methods are compared at "
+                        "matched DEPTH. The per-image alternative "
+                        "(--no-common-threshold) is what a literal reading of "
+                        "'N sigma above sky' gives, but it lets a sparse "
+                        "solver award itself a deeper cut for free: at 3 sigma "
+                        "the truth cuts at 0.0337 while L1, 80%% exact zeros, "
+                        "cuts at 0.0080 -- 1.57 mag deeper on the same field. "
+                        "That inflates its completeness AND its spurious rate "
+                        "at once. NB the common cut sets the DEPTH only; each "
+                        "image's own sky is still used to background-subtract "
+                        "its box fluxes, which are different jobs.")
     p.add_argument("--match-radius", type=float, default=1.0,
                    help="matching radius in pixels (step 5)")
     p.add_argument("--n-bins", type=int, default=8)
