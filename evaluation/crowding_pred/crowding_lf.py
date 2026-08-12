@@ -4,7 +4,9 @@
 For each requested band this script bins the magnitudes into a luminosity
 function, converts the counts to a surface density (stars per square degree),
 and feeds that to `compCrowdError` in crowding.py to predict the crowding
-(confusion) error as a function of magnitude (Olsen, Blum & Rigaut 2003).
+(confusion) error as a function of magnitude (Olsen, Blum & Rigaut 2003). It
+also predicts the completeness from that crowding error using the tanh fit to
+the left panel of their Fig. 14 (see fit_completeness.py).
 
 Run:
     python crowding_lf.py m31b.out --binsize 0.25 --plot m31b_crowd.png
@@ -23,10 +25,20 @@ import numpy as np
 import pandas as pd
 
 import crowding
+from fit_completeness import completeness_model
 
 # Band central wavelengths in microns, used only to derive the diffraction-
 # limited seeing when the user does not supply one.
 BAND_WAVELENGTH_MICRON = {"I": 0.90, "J": 1.25, "H": 1.65, "K": 2.20}
+
+# Best-fit parameters of the completeness law completeness_model, fit with the
+# amplitude fixed at f0=0.5 to the digitized LEFT panel (completeness vs
+# single-band magnitude crowding error) of Fig. 14 of Olsen, Blum & Rigaut
+# (2003); see fit_completeness.py and olsen_fig14_left.txt. Applicable to the
+# per-band magnitude crowding error only, not to the color error.
+COMPLETENESS_F0 = 0.5
+COMPLETENESS_SIGMA0 = 0.2359
+COMPLETENESS_SIGMA_S = 0.1238
 
 
 def diffraction_limited_fwhm(band, diam_m):
@@ -135,17 +147,28 @@ def main(argv=None):
         lum_func = counts / area_deg2
         crowd_error = crowding.compCrowdError(centers, counts, seeing,
                                               lumAreaArcsec=area_arcsec2)
-        results[band] = (counts, crowd_error, seeing)
+        # Predicted completeness from the crowding error, via the Olsen Fig. 14
+        # left-panel fit (magnitude error -> completeness). Empty bins get a
+        # crowd_error of 0 from compCrowdError, which would spuriously read as
+        # fully complete; mask them since completeness is undefined with no stars.
+        completeness = completeness_model(crowd_error, COMPLETENESS_F0,
+                                          COMPLETENESS_SIGMA0, COMPLETENESS_SIGMA_S)
+        completeness[counts == 0] = np.nan
+        results[band] = (counts, crowd_error, completeness, seeing)
 
         outname = f"{prefix}_{band}_crowd.txt"
         header = (f"Crowding errors for band {band} from {args.infile}\n"
                   f"binsize={args.binsize}, seeing={seeing:.5f} arcsec, "
                   f"area={area_deg2:.6e} deg², N={counts.sum()}\n"
-                  f"Crowding error per Olsen, Blum & Rigaut 2003 (AJ 126, 452)\n"
-                  f"mag_center  count  N_per_deg2  crowd_error")
+                  f"Crowding error per Olsen, Blum & Rigaut 2003 (AJ 126, 452); "
+                  f"completeness from their Fig. 14 (left) fit "
+                  f"(sigma0={COMPLETENESS_SIGMA0}, sigma_s={COMPLETENESS_SIGMA_S})\n"
+                  f"mag_center  count  N_per_deg2  crowd_error  completeness")
         np.savetxt(outname,
-                   np.column_stack([centers, counts, lum_func, crowd_error]),
-                   fmt=["%10.4f", "%12d", "%16.6e", "%14.6e"], header=header)
+                   np.column_stack([centers, counts, lum_func, crowd_error,
+                                    completeness]),
+                   fmt=["%10.4f", "%12d", "%16.6e", "%14.6e", "%12.6f"],
+                   header=header)
         print(f"Wrote {outname}  (seeing={seeing:.5f}\", N={counts.sum()})")
 
     if args.plot:
@@ -153,18 +176,22 @@ def main(argv=None):
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        plt.figure(figsize=(7, 5))
-        for band in args.bands:
-            _, crowd_error, seeing = results[band]
-            plt.plot(centers, crowd_error,
-                     label=f"{band} (seeing {seeing:.4f}\")")
-        plt.xlabel("Magnitude")
-        plt.ylabel("Crowding error (mag)")
-        plt.yscale("log")
-        plt.legend()
-        plt.title(f"Predicted crowding errors: {args.infile}")
-        plt.tight_layout()
-        plt.savefig(args.plot, dpi=120)
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax2 = ax.twinx()  # completeness on a shared magnitude axis
+        for band, color in zip(args.bands, ["C0", "C1", "C2", "C3"]):
+            _, crowd_error, completeness, seeing = results[band]
+            ax.plot(centers, crowd_error, color=color,
+                    label=f"{band} (seeing {seeing:.4f}\")")
+            ax2.plot(centers, completeness, color=color, ls="--", alpha=0.7)
+        ax.set_xlabel("Magnitude")
+        ax.set_ylabel("Crowding error (mag)")
+        ax.set_yscale("log")
+        ax2.set_ylabel("Predicted completeness (dashed)")
+        ax2.set_ylim(-0.02, 1.02)
+        ax.legend(loc="center left")
+        ax.set_title(f"Predicted crowding errors and completeness: {args.infile}")
+        fig.tight_layout()
+        fig.savefig(args.plot, dpi=120)
         print(f"Wrote {args.plot}")
 
     if args.color:
