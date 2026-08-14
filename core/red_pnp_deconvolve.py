@@ -98,16 +98,33 @@ from train_conditional_diffusion import ConditionalFlatCNN, cosine_alpha_bar
 # Normalization (torch port of ml-decon core/normalize.py, from norm.json)
 # ----------------------------------------------------------------------------
 class TorchNorm:
-    """forward: physical flux -> model domain; inverse: back. Exact, unclipped."""
+    """forward: physical flux -> model domain; inverse: back. Exact, unclipped.
+
+    ALWAYS COMPUTES IN float64 AND RETURNS float64, whatever the input dtype.
+
+    This is not defensive style, it is required by the transform's own
+    conditioning. `inverse` is median + beta*sinh(y*span + lo_s) with
+    span = 13.33 for m31bK50, so d(flux)/dy = beta*span*cosh(...) -- the
+    derivative grows exponentially in y. Near the bright end one normalized
+    unit is ~14.475 mag, so a float32 rounding of ~6e-8 in y is ~1e-6 mag
+    directly, and the sinh amplifies any error accumulated upstream by a
+    factor that reaches ~1e6 at y = 1.5. float32 also OVERFLOWS to inf at
+    y ~ 2.0, which float64 does not until y ~ 7.
+    """
+
+    DTYPE = torch.float64
 
     def __init__(self, params: dict):
         self.method = params["method"]
+        # json floats are already Python (64-bit) floats; keep them that way
+        # and only ever build tensors from them at DTYPE.
         self.p = {k: float(v) for k, v in params.items() if k != "method"}
         if self.method not in ("asinh", "linear"):
             raise ValueError(f"unsupported normalization: {self.method}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         p = self.p
+        x = x.to(self.DTYPE)
         if self.method == "asinh":
             s = torch.asinh((x - p["median"]) / p["beta"])
             return (s - p["lo_s"]) / (p["hi_s"] - p["lo_s"])
@@ -115,6 +132,7 @@ class TorchNorm:
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         p = self.p
+        y = y.to(self.DTYPE)
         if self.method == "asinh":
             s = y * (p["hi_s"] - p["lo_s"]) + p["lo_s"]
             return p["median"] + p["beta"] * torch.sinh(s)
@@ -132,7 +150,10 @@ def make_otf(kernel: np.ndarray, shape, device):
     kh, kw = k.shape
     pad[:kh, :kw] = k
     pad = np.roll(pad, (-(kh // 2), -(kw // 2)), axis=(0, 1))
-    K = torch.from_numpy(np.fft.rfft2(pad).astype(np.complex64)).to(device)
+    # complex128, not complex64: the x-update divides by (|K|^2 + rho) every
+    # outer iteration, and psf_50_true's MTF falls to ~2% at the band edge, so
+    # the quotient is ill-conditioned exactly where the OTF is smallest.
+    K = torch.from_numpy(np.fft.rfft2(pad).astype(np.complex128)).to(device)
     return K
 
 
@@ -141,7 +162,7 @@ def gaussian_kernel(sigma, truncate=4.0):
     ax = np.arange(-r, r + 1)
     xx, yy = np.meshgrid(ax, ax)
     k = np.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
-    return (k / k.sum()).astype(np.float32)
+    return (k / k.sum()).astype(np.float64)
 
 
 def load_kernel(path):
@@ -156,9 +177,34 @@ def load_kernel(path):
 # ----------------------------------------------------------------------------
 # The denoiser D(x; y): a short deterministic conditional reverse chain
 # ----------------------------------------------------------------------------
+def model_dtype(model) -> torch.dtype:
+    """The dtype the network's weights actually live in."""
+    return next(model.parameters()).dtype
+
+
+def model_eps(model, x_t, y_z, tt):
+    """Call the network across a possible dtype boundary.
+
+    Everything OUTSIDE the network runs in float64 (see TorchNorm). The network
+    itself runs in whatever its weights are -- float32 for the existing
+    checkpoints, float64 if the caller has run `model.double()`. Cast in, cast
+    the prediction straight back, so the chain arithmetic (which is where error
+    accumulates over hundreds of outer iterations) never silently downcasts.
+
+    Note the fp32 network is not a precision leak worth fixing by doubling the
+    weights: its output eps is a LEARNED quantity whose own error is ~1e-2, six
+    orders above fp32 epsilon. What float64 protects is the arithmetic wrapped
+    around it -- the asinh inverse, the FFT solve, and the ADMM recursion.
+    """
+    md = model_dtype(model)
+    out_dtype = x_t.dtype
+    return model(x_t.to(md), y_z.to(md), tt).to(out_dtype)
+
+
 @torch.no_grad()
 def tweedie_chain(model, z, y_z, t0, n_steps, alpha_bar, guidance=1.0,
-                  has_null=False, eta=0.0, generator=None, clamp=(0.0, 1.0)):
+                  has_null=False, eta=0.0, generator=None, clamp=(0.0, 0.9),
+                  renoise=False, trace=None, inject_scale=1.0):
     """DDIM reverse chain from t0 down to 0, in the model's normalized domain.
 
     n_steps=1 is the bare Tweedie step  z0 = (x_t - sqrt(1-abar) eps)/sqrt(abar).
@@ -174,38 +220,128 @@ def tweedie_chain(model, z, y_z, t0, n_steps, alpha_bar, guidance=1.0,
     injected: the RED iterate already carries its own error, and injecting
     fresh noise on top makes D stochastic, which breaks the RED gradient (it
     is a valid gradient only for a deterministic, locally homogeneous D).
+
+    inject_scale DECOUPLES the injected noise level from the conditioning
+    level, which is the central prescription of Park et al. 2026 ("Stochastic
+    Generative Plug-and-Play Priors", arXiv:2604.03603), Sec. 3.2 / App. C.1:
+
+        z_k = DC_k(x_k; y),   x_{k+1} = D_theta(z_k + sigma_inject * n;
+                                                sigma_cond)
+
+    renoise=True with inject_scale=1.0 is the MATCHED setting sigma_inject =
+    sigma_cond, i.e. exactly SNORE's assumption. The paper's point is that the
+    match is wrong: an ADMM iterate carries residual measurement noise and
+    forward-operator artifacts on top of the injected noise, so the denoiser
+    should be conditioned at a HIGHER level than it is perturbed at. Setting
+    inject_scale < 1 gives sigma_inject < sigma_cond. Their CS-MRI ADMM row
+    uses sigma_cond/sigma_inject = 100 (inject_scale 0.01) and gains +1.88 dB
+    over matched; their deblurring row stays matched. Worth a sweep, not a
+    default -- so this defaults to 1.0, which is the previous behaviour.
+
+    renoise=True overrides that and does a PROPER forward diffusion to level
+    t0:   x_t = sqrt(abar)*z + sqrt(1-abar)*eps.
+    Use it when the input is CLEANER than its timestep implies -- which is the
+    case late in an ADMM run, where z has nearly converged and carries far
+    less noise than sigma(t0). Feeding a too-clean input to the model is
+    out-of-distribution in the direction that makes it do nothing, so the
+    chain preserves the blurry coarse structure instead of regenerating sharp
+    sources. Renoising restores the training-time relationship between the
+    input and the timestep embedding, and sets the amount from t0, a quantity
+    with meaning, rather than an unbounded multiplier.
+
+    CORRECTION (measured 2026-08-11): the claim that eta > 1 "deletes every
+    refinement step" by driving 1 - abar_next - s^2 negative is FALSE at the
+    settings actually used. That term only goes negative near the END of the
+    chain, where 1 - abar_next is already tiny. At t0=75, n_steps=20 the count
+    of zeroed steps is 0/19 at eta=1.0, 2/19 at eta=1.5, 6/19 at eta=2.0 -- so
+    eta=1.5 runs 17 intact DDIM steps and simply injects ~5.6x more total noise
+    than renoise alone (0.735 vs 0.130). It over-noises, which may or may not be
+    wanted, but it is not structurally broken. The zeroing only bites hard with
+    LARGE step gaps (few steps over a long range). See --eta's help text in
+    admm_diffusion_deconvolve.py, which still states the old claim.
+
+    trace: optional list. If given, one dict per chain step is appended,
+    recording how far z0 moves per step (in normalized units, RMS) and whether
+    the deterministic direction term survived. Use it to test whether the late
+    chain is contributing at all -- at eta=0 the deterministic coefficient
+    decays 0.124 -> 0.006 across a t0=75 chain, and if dz0 decays with it the
+    last steps are dead weight and entry-only renoising cannot reach them.
     """
+    # The whole chain runs at z's dtype (float64 when reached through
+    # TorchNorm.forward); alpha_bar is indexed into that dtype so no product
+    # below silently promotes or demotes.
+    dt = z.dtype
+    alpha_bar = alpha_bar.to(dt)
     x_t = alpha_bar[int(t0)].sqrt() * z
+    if renoise:
+        # inject_scale = sigma_inject / sigma_cond. 1.0 reproduces matched
+        # forward diffusion; < 1 is the paper's decoupled regime.
+        x_t = x_t + inject_scale * (1 - alpha_bar[int(t0)]).sqrt() * torch.randn(
+            z.shape, device=z.device, generator=generator, dtype=dt)
     grid = np.unique(np.linspace(0, int(t0), max(int(n_steps), 1)).astype(int))[::-1]
     null = torch.zeros_like(y_z)
+    z0_prev = None
 
     for i, t_cur in enumerate(grid):
         ab_t = alpha_bar[int(t_cur)]
         tt = torch.full((z.shape[0],), int(t_cur), device=z.device,
                         dtype=torch.long)
-        eps = model(x_t, y_z, tt)
+        eps = model_eps(model, x_t, y_z, tt)
         if guidance != 1.0:
             if not has_null:
                 raise ValueError("--guidance != 1 needs a checkpoint trained "
                                  "with p_uncond > 0 (null token is untrained "
                                  "otherwise)")
-            eps = model(x_t, null, tt) * (1 - guidance) + eps * guidance
+            eps = (model_eps(model, x_t, null, tt) * (1 - guidance)
+                   + eps * guidance)
         z0 = (x_t - (1 - ab_t).sqrt() * eps) / ab_t.sqrt()
         if clamp is not None:
             # The asinh inverse is EXPLOSIVE at the bright end: for m31bK50 the
             # s-span is 13.3, so normalized 1.0 -> flux 1780 but 1.2 -> 2.6e4
             # and 1.5 -> 1.4e6. A 20% overshoot in normalized units is a 14x
             # flux error, and 2.0 overflows float32 to inf. Training data is
-            # exactly [0, 1], so clamping there is the data's own support.
+            #exactly [0, 1], so clamping there is the data's own support.
+            frac_lo = float((z0 < clamp[0]).float().mean())
+            frac_hi = float((z0 > clamp[1]).float().mean())
             z0 = z0.clamp(clamp[0], clamp[1])
-        if i + 1 == len(grid):
+        else:
+            frac_lo = frac_hi = 0.0
+
+        last = (i + 1 == len(grid))
+        if not last:
+            ab_n = alpha_bar[int(grid[i + 1])]
+            s = eta * ((1 - ab_n) / (1 - ab_t)).sqrt() * (1 - ab_t / ab_n).sqrt()
+            det_raw = float(1 - ab_n - s ** 2)      # BEFORE the clamp at 0
+            det = (1 - ab_n - s ** 2).clamp(min=0).sqrt()
+
+        if trace is not None:
+            # RMS, not the raw norm, so the numbers are per-pixel normalized
+            # units and directly comparable across patch counts. In this
+            # dataset's asinh domain 1 normalized unit ~ 14.475 mag at the
+            # bright end, so dz0 = 0.001 is ~0.0145 mag.
+            n = z0.numel()
+            trace.append({
+                "step": i,
+                "t": int(t_cur),
+                "t_next": int(grid[i + 1]) if not last else 0,
+                "dz0_rms": (float(torch.linalg.vector_norm(z0 - z0_prev))
+                            / n ** 0.5) if z0_prev is not None else float("nan"),
+                "z0_rms": float(torch.linalg.vector_norm(z0)) / n ** 0.5,
+                "eps_rms": float(torch.linalg.vector_norm(eps)) / n ** 0.5,
+                "det_coef": float(det) if not last else float("nan"),
+                "noise_coef": float(s) if not last else float("nan"),
+                "det_zeroed": bool(det_raw < 0) if not last else False,
+                "clamp_frac_lo": frac_lo,
+                "clamp_frac_hi": frac_hi,
+            })
+
+        if last:
             return z0
-        ab_n = alpha_bar[int(grid[i + 1])]
-        s = eta * ((1 - ab_n) / (1 - ab_t)).sqrt() * (1 - ab_t / ab_n).sqrt()
-        x_t = ab_n.sqrt() * z0 + (1 - ab_n - s ** 2).clamp(min=0).sqrt() * eps
+        z0_prev = z0
+        x_t = ab_n.sqrt() * z0 + det * eps
         if eta > 0:
             x_t = x_t + s * torch.randn(x_t.shape, device=x_t.device,
-                                        generator=generator)
+                                        generator=generator, dtype=dt)
     return z0
 
 
@@ -214,11 +350,11 @@ def red_denoise(model, x_phys, y_z, t, alpha_bar, ideal_norm, n_steps=1,
                 guidance=1.0, has_null=False, add_noise=False, generator=None,
                 clamp=None, eta=0.0):
     """D(x; y) in PHYSICAL FLUX: normalize -> reverse chain -> denormalize."""
-    z = ideal_norm.forward(x_phys)
+    z = ideal_norm.forward(x_phys)          # float64 from here on
     if add_noise:
-        ab = alpha_bar[int(t)]
+        ab = alpha_bar.to(z.dtype)[int(t)]
         z = z + ((1 - ab).sqrt() / ab.sqrt()) * torch.randn(
-            z.shape, device=z.device, generator=generator)
+            z.shape, device=z.device, generator=generator, dtype=z.dtype)
     z0 = tweedie_chain(model, z, y_z, t, n_steps, alpha_bar, guidance=guidance,
                        has_null=has_null, eta=eta, generator=generator,
                        clamp=clamp)
@@ -228,7 +364,13 @@ def red_denoise(model, x_phys, y_z, t, alpha_bar, ideal_norm, n_steps=1,
 # ----------------------------------------------------------------------------
 # Checkpoint / data loading
 # ----------------------------------------------------------------------------
-def load_checkpoint(path, device, weights="ema"):
+def load_checkpoint(path, device, weights="ema", dtype=torch.float32):
+    """`dtype` casts the NETWORK's weights. Default float32 = as trained.
+
+    float64 makes the forward pass exact to the weights but does not make the
+    weights themselves more accurate, and roughly triples CPU inference cost.
+    Everything around the network is float64 regardless -- see model_eps.
+    """
     ck = torch.load(path, map_location=device, weights_only=False)
     if "dataset_norm" not in ck:
         raise KeyError(
@@ -245,8 +387,10 @@ def load_checkpoint(path, device, weights="ema"):
     state = {k.split("ema_model.")[-1]: v for k, v in state.items()}
     model.load_state_dict(state)
     model.eval()
+    model.to(dtype)
     T = ck["diffusion"]["timesteps"]
     print(f"[ckpt] {path}  weights={state_key}  T={T}  "
+          f"net_dtype={str(dtype).replace('torch.', '')}  "
           f"identity_frac={ck.get('identity_frac')}  "
           f"low_t_frac={ck.get('low_t_frac')}  p_uncond={ck.get('p_uncond')}")
     return model, T, ck
@@ -270,11 +414,35 @@ def sig_std(a, iters=5, k=3.0):
     return float(np.std(a))
 
 
-def show(ax, img, title):
-    lw = max(sig_std(img), 1e-30)
-    ax.imshow(img, origin="lower", cmap="gray",
-              norm=AsinhNorm(linear_width=lw, vmin=float(img.min()),
-                             vmax=float(img.max())))
+def shared_norm(ref, vmax=None):
+    """One AsinhNorm for every panel of a figure, derived from `ref`.
+
+    Pass the TRUTH panel as `ref`. Without this, `show` recomputes the stretch
+    per panel from that panel's own min/max/noise, so two panels holding nearly
+    identical data can look completely different -- a wing at a few
+    ten-thousandths of the peak renders at mid-grey in one panel and black in
+    the next. That artifact has repeatedly read as "the reconstruction is
+    blurred at bright stars" when the measured radial profiles were identical
+    to truth within 3e-4.
+
+    `vmax` defaults to ref.max(); pass an explicit value when a reconstruction
+    can legitimately overshoot the truth and you want the excess visible rather
+    than saturated.
+    """
+    return AsinhNorm(linear_width=max(sig_std(ref), 1e-30),
+                     vmin=float(ref.min()),
+                     vmax=float(ref.max()) if vmax is None else float(vmax))
+
+
+def show(ax, img, title, norm=None):
+    """`norm=None` keeps the old per-panel stretch (every existing caller).
+
+    Pass a `shared_norm(truth)` to make panels comparable by eye.
+    """
+    if norm is None:
+        norm = AsinhNorm(linear_width=max(sig_std(img), 1e-30),
+                         vmin=float(img.min()), vmax=float(img.max()))
+    ax.imshow(img, origin="lower", cmap="gray", norm=norm)
     ax.set_title(title, fontsize=9)
     ax.axis("off")
 
@@ -356,10 +524,12 @@ def main():
     print(f"[data] {args.split}: solving {len(idx)} patches {idx} "
           f"of {len(observed)}")
 
-    y_z = torch.from_numpy(observed[idx]).float().to(device)      # conditioning
+    # .double(): the .npy is float32 on disk so the cast is exact, but it keeps
+    # every downstream op (norm inverse, FFT, RED recursion) in float64.
+    y_z = torch.from_numpy(observed[idx]).double().to(device)     # conditioning
     y_phys = obs_norm.inverse(y_z)                                # data term
     truth = ideal_norm.inverse(
-        torch.from_numpy(ideal[idx]).float().to(device))
+        torch.from_numpy(ideal[idx]).double().to(device))
     B, _, H, W = y_z.shape
 
     # --- forward operator ---------------------------------------------------
