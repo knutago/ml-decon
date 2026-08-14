@@ -883,12 +883,14 @@ def main():
         show(ax[i2, 1], z_np[i2, 0], f"ADMM+diffusion  {lbl}", norm=nrm)
         col = 2
         if cmp_np is not None:
-            # Rescale the rival by its fitted gain so the shared stretch is
-            # meaningful -- otherwise a units difference reads as a brightness
-            # difference and the panels are not comparable after all.
-            show(ax[i2, col], cmp_np[i2, 0] * (g_ours / max(g_them, 1e-30)),
+            # Put the rival on THIS run's scale. Both g_ours*(A z) and
+            # g_them*(A c) approximate b, so g_ours*z and g_them*c share a
+            # scale; showing z unscaled therefore needs c * (g_them/g_ours).
+            # The inverse ratio is a 166x over-brightening on m32 and renders
+            # the panel solid white -- get this the right way round.
+            show(ax[i2, col], cmp_np[i2, 0] * (g_them / max(g_ours, 1e-30)),
                  f"{args.compare_label or os.path.basename(args.compare_file)}"
-                 f"\n(gain-matched; NOT a truth)", norm=nrm)
+                 f"\n(gain-matched to this run; NOT a truth)", norm=nrm)
             col += 1
         if have_truth:
             show(ax[i2, col], truth_np[i2], "ideal (truth)", norm=nrm)
