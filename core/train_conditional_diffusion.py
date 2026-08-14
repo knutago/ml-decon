@@ -136,14 +136,23 @@ def load_split(data_dir: Path, split: str):
 # Cosine noise schedule (Nichol & Dhariwal 2021, as used in the DPS paper)
 # ----------------------------------------------------------------------------
 
-def cosine_alpha_bar(T: int, s: float = 0.008) -> torch.Tensor:
+def cosine_alpha_bar(T: int, s: float = 0.008,
+                     dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """alpha_bar[t], t = 0..T-1. Always COMPUTED in float64.
+
+    `dtype` sets only the return dtype. It defaults to float32 so training is
+    bit-for-bit unchanged; the solvers pass float64 so that the schedule they
+    derive sigma(t) from is not pre-rounded to ~1e-7 relative. That rounding
+    matters downstream because a normalized-domain error is amplified by
+    dmag/dz = 14.475 at the bright end of this dataset's asinh transform.
+    """
     steps = torch.arange(T + 1, dtype=torch.float64)
     f = torch.cos(((steps / T) + s) / (1 + s) * math.pi / 2) ** 2
     alpha_bar = f / f[0]
     betas = 1 - (alpha_bar[1:] / alpha_bar[:-1])
     betas = betas.clamp(1e-8, 0.999)
     alphas = 1.0 - betas
-    return torch.cumprod(alphas, dim=0).float()  # alpha_bar[t], t = 0..T-1
+    return torch.cumprod(alphas, dim=0).to(dtype)
 
 
 # ----------------------------------------------------------------------------
@@ -154,13 +163,21 @@ class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
+        # This module has no parameters, so `model.to(float64)` had no way to
+        # reach it and the hardcoded .float() below produced a float32 embedding
+        # that then hit float64 Linear weights ("mat1 and mat2 must have the
+        # same dtype"). A non-persistent buffer tracks the module dtype without
+        # entering state_dict, so existing checkpoints load unchanged.
+        self.register_buffer("_dtype_probe", torch.zeros(1), persistent=False)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
+        dt = self._dtype_probe.dtype
         half = self.dim // 2
         freqs = torch.exp(
-            -math.log(10000.0) * torch.arange(half, device=t.device).float() / half
+            -math.log(10000.0)
+            * torch.arange(half, device=t.device, dtype=dt) / half
         )
-        args = t.float()[:, None] * freqs[None, :]
+        args = t.to(dt)[:, None] * freqs[None, :]
         return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
 
