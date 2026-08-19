@@ -1,0 +1,18 @@
+seed: 0
+data:
+  observed_fits: data/m32/Klong.fits
+  # NOT m3201newK.fits -- that one is 91% exact zeros, so its sigma-clipped std
+  # is exactly 0, normalize.py's `beta = asinh_softening * std or 1.0` falls back
+  # to beta=1.0, and asinh_softening becomes inert. The _floored version carries
+  # the noise floor that makes the fit well-posed (and that the prior expects).
+  ideal_fits:    data/m32/m3201newK.fits
+  out_dir:       data/m32_klong
+  patch_size:    64
+  stride:        32
+  split_block_size: 512
+  val_fraction:  0.1
+  observed_normalize: asinh
+  ideal_normalize:    asinh
+  # 1.0 to MATCH m31bK50, so checkpoints_cond_diffusion_npy/best.pt sees the same
+  # z domain. Only raise to 3.0 if you are retraining from scratch on m32.
+  asinh_softening:    3.0
