@@ -102,7 +102,17 @@ def main(config_path):
     gain, sky, ci = fit_affine_photometry(observed_image, ideal_image,
                                       block=data.patch_size,
                                       margin=4 * data.patch_size) #compute scale flux difference between ideal and observed iamges
-    observed_image = (observed_image - sky) / gain
+    # The fit is always REPORTED, so the two variants stay comparable and the
+    # numbers that were applied (or deliberately not) are in the log either way.
+    if data.fit_photometry:
+        observed_image = (observed_image - sky) / gain
+    else:
+        print(f"[photometry] fit_photometry=false: observed left in NATIVE "
+              f"units, sky included. Would have applied (obs - {sky:.6g}) / "
+              f"{gain:.6g}.")
+        print(f"[photometry]   the pair is therefore NOT photometrically "
+              f"matched -- the network must absorb the gain, and flux ratios "
+              f"against the ideal carry a factor {gain:.6g}.")
     height, width = observed_image.shape
 
     patch_size = data.patch_size

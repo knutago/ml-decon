@@ -1,0 +1,33 @@
+# m32_klong_withsky
+#
+# Identical to the config that produced data/m32_klong_nosky EXCEPT for
+# fit_photometry: false, which skips gen_data.py's
+#     observed_image = (observed_image - sky) / gain
+# so the observed patches keep the frame's own sky and flux scale.
+#
+# Why: the model trained on the subtracted version leaks 13% of each patch's
+# sky into its output, correlated +0.93 with the true per-patch sky, and no
+# correction in the forward operator can reach that (it is emitted by the
+# network). One global subtraction cannot remove a pedestal that varies 250x
+# across the field, so the alternative is to show the model the pedestal and
+# train it to be invariant -- which needs the sky present in the data.
+#
+# Pair this with sky augmentation at training time: add a random constant to
+# the observed patch, leave the ideal unchanged. Without that augmentation this
+# dataset is strictly HARDER than the subtracted one, because the network now
+# has to absorb the gain (0.822) as well.
+seed: 0
+data:
+  observed_fits: data/m32/Klong.fits
+  ideal_fits: data/m32/m3201newK.fits
+  out_dir: data/m32_klong_withsky
+  patch_size: 64
+  stride: 32
+  observed_normalize: asinh
+  ideal_normalize: asinh
+  asinh_softening: 1.0
+  observed_asinh_beta: null
+  ideal_asinh_beta: null
+  split_block_size: 512
+  val_fraction: 0.1
+  fit_photometry: false

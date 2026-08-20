@@ -36,6 +36,23 @@ class DataConfig:
     ideal_asinh_beta: float | None = None
     split_block_size: int = 505  # side length (px) of blocks assigned wholesale to train or val
     val_fraction: float = 0.2
+    # Whether to put the observed image into the IDEAL's photometric units --
+    # (observed - sky)/gain, fitted on block means -- before cutting patches.
+    #
+    # True (the default, and what every dataset before 2026-08-20 used) makes
+    # the pair photometrically consistent, so the network never sees the frame's
+    # sky level. That is also its weakness: the sky is NOT constant across these
+    # frames (M32's diffuse light varies 2.2x across Klong), one global
+    # subtraction leaves a per-patch residual spanning 250x, and the trained
+    # model leaks 13% of it into its output, correlated +0.93 with the true
+    # per-patch sky.
+    #
+    # False leaves the observed in native units, sky included, so the model sees
+    # the pedestal explicitly and can be taught invariance to it (pair with sky
+    # augmentation at training time). The ideal is untouched either way, so with
+    # False the pair is NOT photometrically matched: the network has to absorb
+    # the gain too, and any flux ratio measured against the ideal carries it.
+    fit_photometry: bool = True
 
 
 @dataclass

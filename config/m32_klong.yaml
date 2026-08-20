@@ -1,18 +1,24 @@
 seed: 0
 data:
   observed_fits: data/m32/Klong.fits
-  # NOT m3201newK.fits -- that one is 91% exact zeros, so its sigma-clipped std
-  # is exactly 0, normalize.py's `beta = asinh_softening * std or 1.0` falls back
-  # to beta=1.0, and asinh_softening becomes inert. The _floored version carries
-  # the noise floor that makes the fit well-posed (and that the prior expects).
+  # The raw m3201newK.fits is now usable: it is 91% exact zeros, so its sigma-clipped
+  # std is 0 and asinh_softening has nothing to scale, but normalize.py no longer
+  # answers that with beta = 1.0. It detects the sparse field, derives beta from the
+  # source population (0.01743), and warns. That is the target you actually want --
+  # the catalogue. m3201newK_floored.fits carries a FABRICATED noise floor (corr with
+  # Klong -0.0008) that exists only to make the m31-trained checkpoint transferable;
+  # training natively on m32 does not need it. Swap back only to reproduce old runs.
   ideal_fits:    data/m32/m3201newK.fits
-  out_dir:       data/m32_klong
+  out_dir:       data/m32_klong_nosky
   patch_size:    64
   stride:        32
   split_block_size: 512
   val_fraction:  0.1
   observed_normalize: asinh
   ideal_normalize:    asinh
-  # 1.0 to MATCH m31bK50, so checkpoints_cond_diffusion_npy/best.pt sees the same
-  # z domain. Only raise to 3.0 if you are retraining from scratch on m32.
-  asinh_softening:    3.0
+  # Inert on a sparse ideal (it multiplies a zero std) but live on the observed
+  # channel, where it sets the knee at softening x background noise.
+  asinh_softening:    1.0
+  # Pin the ideal knee in flux units instead of letting the sparse fallback pick it.
+  # Uncomment to reproduce the value fix_ideal_beta.py wrote into data/m32_klong:
+  # ideal_asinh_beta: 0.017521
