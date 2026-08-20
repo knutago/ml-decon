@@ -1,0 +1,52 @@
+# seed 6, NOT 0. M32 is a compact elliptical with a 10.6x brightness gradient
+# across the patch grid, and only 6 of the 64 512px blocks go to val, so which
+# blocks are drawn matters enormously. Seed 0 put val in the bright core: val's
+# median patch brightness came out 67% above train's, source density 70% above,
+# and the observed z histograms did not overlap -- val loss would not have
+# tracked train loss. Seeds scored on four metrics (patch brightness, source
+# density, saturation fraction, total ideal flux); seed 6 is within 1.2% on all
+# four, seed 1 within 3.5%, every other seed 10-100% off on at least one.
+seed: 6
+data:
+  observed_fits: data/m32/Klong.fits
+
+  # The RAW catalogue rendering, NOT m3201newK_floored.fits. The floored file
+  # carries a fabricated noise floor (corr with Klong -0.0008, flat power
+  # spectrum) whose only purpose was making the m31-trained checkpoint
+  # transferable to m32. Training natively on m32 does not need it, and it puts
+  # a ~13% irreducible floor under interior rmse.
+  #
+  # This file is 91% exact zeros, so its sigma-clipped std is 0 and
+  # asinh_softening has nothing to scale. core.normalize.fit_asinh_beta detects
+  # that (>20% of pixels at exactly the clipped median), derives beta from the
+  # median of the source pixels, and warns. It no longer answers with beta=1.0,
+  # which is what silently flattened the asinh into a linear map and crushed
+  # every source below z=0.005 in the previous two datasets.
+  ideal_fits:    data/m32/m3201newK.fits
+
+  # A NEW directory on purpose. data/m32_klong and data/m32_klong_nosky have
+  # both held several incompatible datasets today, and the Vista checkpoints
+  # record a `data_dir` of .../m32_klong_nosky pointing at a DIFFERENT (beta=1.0)
+  # dataset. Reusing either name makes it impossible to tell from a checkpoint
+  # which one it saw.
+  out_dir:       data/m32_klong_sparse
+
+  patch_size:    64
+  stride:        32            # 50% overlap, as every previous m32 run
+  split_block_size: 512        # whole 512px blocks go to train or val, never split
+  val_fraction:  0.1
+
+  observed_normalize: asinh
+  ideal_normalize:    asinh
+
+  # Observed channel only (inert on the sparse ideal). 1.0 puts m32's observed
+  # z at p50 0.076 / p99 0.79, against m31bK50's p50 0.131 / p99 0.54 -- the
+  # closest match to the domain that trained correctly. 3.0 compresses it to
+  # p50 0.040, roughly half of m31's.
+  asinh_softening:    1.0
+
+  # Left unpinned: fit_asinh_beta derives 0.01743 from the source population,
+  # which fix_ideal_beta.py independently reproduces to the digit (0.017521 on
+  # a slightly different split). The resolved value is recorded in norm.json.
+  # Pin it here only if you need bit-identical patches across regenerations.
+  # ideal_asinh_beta: 0.01743

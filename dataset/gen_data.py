@@ -116,9 +116,23 @@ def main(config_path):
     splits = np.array(splits)
     train_mask = splits == "train"
     observed_norm = fit_normalization(observed_raw[train_mask], data.observed_normalize,
-                                      asinh_softening=data.asinh_softening)
+                                      asinh_softening=data.asinh_softening,
+                                      asinh_beta=data.observed_asinh_beta)
     ideal_norm = fit_normalization(ideal_raw[train_mask], data.ideal_normalize,
-                                   asinh_softening=data.asinh_softening)
+                                   asinh_softening=data.asinh_softening,
+                                   asinh_beta=data.ideal_asinh_beta)
+
+    # Report the fitted transforms. A bad normalization is invisible in the patches
+    # themselves and only surfaces much later as a bad reconstruction, so put the numbers
+    # that matter -- the knee and where the sources actually land in z -- in the log.
+    print(f"gain={gain:.6g} sky={sky:.6g} (CI {ci[0]:.6g} .. {ci[1]:.6g})")
+    for name, norm, raw in (("observed", observed_norm, observed_raw[train_mask]),
+                            ("ideal", ideal_norm, ideal_raw[train_mask])):
+        z = norm.forward(raw)
+        print(f"{name:>8} norm: {norm.to_dict()}")
+        print(f"{'':>8}  train z p1/p50/p99/p99.9 = {np.percentile(z, 1):.4f} "
+              f"{np.percentile(z, 50):.4f} {np.percentile(z, 99):.4f} "
+              f"{np.percentile(z, 99.9):.4f}   flux exactly zero: {np.mean(raw == 0):.2%}")
 
     observed = observed_norm.forward(observed_raw).astype(np.float32)
     ideal = ideal_norm.forward(ideal_raw).astype(np.float32)

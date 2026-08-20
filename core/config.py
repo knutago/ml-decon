@@ -28,6 +28,12 @@ class DataConfig:
     observed_normalize: str = "asinh"  # asinh | log | linear — applied to the observed image
     ideal_normalize: str = "asinh"  # normalization for the sparse ideal field
     asinh_softening: float = 3.0  # asinh transition width in units of the sigma-clipped noise std
+    # Pin the asinh knee in FLUX units, bypassing asinh_softening for that channel. Needed
+    # for a sparse field (point sources on exact zero), whose sigma-clipped std is exactly
+    # 0 so asinh_softening has nothing to scale — see core.normalize.fit_asinh_beta. Leave
+    # as None to fit from the background, which is right whenever there is a background.
+    observed_asinh_beta: float | None = None
+    ideal_asinh_beta: float | None = None
     split_block_size: int = 505  # side length (px) of blocks assigned wholesale to train or val
     val_fraction: float = 0.2
 
