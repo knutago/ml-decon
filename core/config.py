@@ -53,6 +53,18 @@ class DataConfig:
     # False the pair is NOT photometrically matched: the network has to absorb
     # the gain too, and any flux ratio measured against the ideal carries it.
     fit_photometry: bool = True
+    # Region of the FITS to cut patches from, as [y0, y1, x0, x1], or "auto" for
+    # the bounding box of pixels nonzero in BOTH images. None cuts the whole frame.
+    #
+    # Needed whenever a frame is zero-padded beyond its actual footprint, which
+    # the M31f11 simulations are: the data occupies [0:2786, 0:2786] of a
+    # 4244x4214 array, so 56.6% of the frame is exact zeros. Cutting without a
+    # crop is silently destructive twice over -- 54.5% of patches come out 100%
+    # blank, and the normalization is FITTED on those pixels, which drags the
+    # sigma-clipped median to exactly 0 and beta to half its true value
+    # (0.012096 against the correct 0.022329 on M31f11simF475W). Every real
+    # patch would then be stretched through a transform fitted to blank sky.
+    crop: list | str | None = None
 
 
 @dataclass

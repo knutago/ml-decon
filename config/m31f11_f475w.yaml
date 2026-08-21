@@ -1,0 +1,37 @@
+# M31 field 11 simulation, F475W — sim/truth pair, no photometry rescaling.
+#
+# fit_photometry: false, as requested. On THIS pair it is also a no-op by
+# construction, which is worth knowing: the block-mean Theil-Sen fit returns
+#   F475W:  sim = ~1.000 * truth + ~0
+# (F475W 0.99998 / -4.3e-05, F814W 1.00022 / -2.6e-03; slope CIs within
+# +-0.0006 of unity), so (observed - sky)/gain would multiply by 1.0000. The
+# flag matters here as documentation, not as arithmetic.
+#
+# Leaving it off is also the SAFE choice for a different reason: this truth
+# CONTAINS the diffuse light (background: truth 0.0258 vs sim 0.0366 in F475W,
+# 0.2217 vs 0.4520 in F814W). The pair is already photometrically consistent,
+# so the model can reproduce the background instead of having to infer and
+# cancel it. Subtracting a sky from the observed while leaving the truth alone
+# would BREAK that consistency and manufacture the mismatch that produced the
+# m32 sky leak (13% residual, r=+0.93) and the over-fragmented catalogue.
+#
+# crop: auto is REQUIRED. These frames are zero-padded to 4244x4214 around a
+# [0:2786, 0:2786] footprint -- 56.6% exact zeros. Without the crop, 54.5% of
+# patches are 100% blank AND the normalization is fitted on the padding, which
+# halves beta (0.012096 vs the correct 0.022329).
+seed: 0
+data:
+  observed_fits: data/m32_v2_sim/M31f11simF475W.fits
+  ideal_fits: data/m32_v2_sim/M31f11truthF475W.fits
+  out_dir: data/m31f11_f475w
+  patch_size: 64
+  stride: 32
+  observed_normalize: asinh
+  ideal_normalize: asinh
+  asinh_softening: 1.0
+  observed_asinh_beta: null
+  ideal_asinh_beta: null
+  split_block_size: 512
+  val_fraction: 0.1
+  fit_photometry: false
+  crop: auto

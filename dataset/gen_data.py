@@ -99,6 +99,25 @@ def main(config_path):
     if observed_image.shape != ideal_image.shape:
         raise ValueError(f"observed {observed_image.shape} and ideal {ideal_image.shape} "
                          "FITS must share a pixel grid")
+    # Crop to the real footprint BEFORE anything is fitted. Both the photometry
+    # fit and the normalization are fitted from pixel values, so zero padding
+    # left in at this point corrupts them silently.
+    if data.crop is not None:
+        if data.crop == "auto":
+            valid = (observed_image != 0) & (ideal_image != 0)
+            ys, xs = np.where(valid)
+            if not len(ys):
+                raise ValueError("crop='auto' but no pixel is nonzero in both images")
+            y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+        else:
+            y0, y1, x0, x1 = (int(v) for v in data.crop)
+        before = observed_image.shape
+        observed_image = observed_image[y0:y1, x0:x1]
+        ideal_image = ideal_image[y0:y1, x0:x1]
+        zf = 100.0 * float((observed_image == 0).mean())
+        print(f"[crop] {before} -> [{y0}:{y1},{x0}:{x1}] = {observed_image.shape}"
+              f"   ({zf:.1f}% of the cropped region is still exactly zero)")
+
     gain, sky, ci = fit_affine_photometry(observed_image, ideal_image,
                                       block=data.patch_size,
                                       margin=4 * data.patch_size) #compute scale flux difference between ideal and observed iamges
