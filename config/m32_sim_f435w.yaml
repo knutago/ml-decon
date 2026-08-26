@@ -1,0 +1,48 @@
+# M32 v2 simulation, F435W — sim/truth pair, no photometry rescaling.
+#
+# WHY THIS PAIR MATTERS: its blur matches the measured ef frame.
+#   sim F435W  FWHM 3.14 px (F435W) / 3.49 px (F555W), MTF@Nyquist 0.002/0.001
+#   ef frame       FWHM 3.10 px,                            MTF@Nyquist 0.003
+# Both are cleanly sampled. The previous M31f11 sims were UNDERSAMPLED (1.47 and
+# 1.15 px FWHM, MTF@Nyquist 0.073 and 0.234), so a model trained on them learned
+# to invert an aliased operator and under-sharpened badly on ef: concentration
+# 0.092 against l160's 0.297. That failure mode should not recur here.
+#
+# fit_photometry: false, as requested. The fit is reported either way:
+#   F435W: conv = ~0.97 * (psf*truth) + sky, sky 163 (F435W) / 240 (F555W) counts.
+# Note this flag is a NO-OP on the encoded patches: fit_normalization derives the
+# asinh median and beta FROM the data, so an affine change of the input produces
+# the exact affine image of the transform and (x-median)/beta is invariant.
+# Verified byte-identical on the Klong pair (max |diff| 1.8e-07). It is kept
+# false because that is the honest description of what the data contains.
+#
+# crop: not needed. Unlike the M31f11 frames (zero-padded to 4244x4214 around a
+# 2786^2 footprint) these are 100% populated over the full 2048^2.
+#
+# KNOWN LIMITATION, unchanged from the Klong pairing: the TRUTH IS A CATALOGUE
+# RENDERING -- 94.52% exact zeros, sigma-clipped std exactly 0 -- while the conv
+# carries a sky pedestal of 163-240 counts. The diffuse light therefore has no
+# representation in the target, and a model trained on this pair must infer and
+# cancel a background that is not in its output space. On Klong that produced a
+# 13% sky leak correlated +0.93 with the true per-patch sky, and a catalogue
+# over-fragmented 2.1x against l160. Expect the same here unless the truth is
+# regenerated with a diffuse component.
+#
+# The sparse truth also trips core.normalize.fit_asinh_beta's sparse-field path,
+# which WILL warn. That warning is the fix working, not a failure -- beta comes
+# from the median of the pixels above the median instead of a 1.0 fallback.
+seed: 0
+data:
+  observed_fits: data/m32_sim/sim_f435w_conv.fits
+  ideal_fits: data/m32_sim/sim_f435w_truth.fits
+  out_dir: data/m32_sim_f435w
+  patch_size: 64
+  stride: 32
+  observed_normalize: asinh
+  ideal_normalize: asinh
+  asinh_softening: 1.0
+  observed_asinh_beta: null
+  ideal_asinh_beta: null
+  split_block_size: 512
+  val_fraction: 0.1
+  fit_photometry: false
