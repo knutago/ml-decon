@@ -80,6 +80,116 @@ from torch.utils.data import DataLoader, Dataset
 # Dataset
 # ----------------------------------------------------------------------------
 
+class SkyAug:
+    """Random sky pedestal added to the OBSERVED channel only.
+
+    Each 64px patch of M32 sits at a different galactocentric radius and so
+    carries a different diffuse pedestal -- measured 0.0001 to 0.052 in flux
+    across the field, a 250x range. The conditional model has to infer that
+    level from the patch alone, and it gets only 87% of the way: the residue
+    left in the reconstruction tracks the true sky at r = +0.93, and IS the
+    non-zero background floor (bkg0 0.00072 / zero% 15.2 against the truth's
+    0.00000 / 94.7).
+
+    Adding a random constant to the observed while leaving the ideal
+    untouched breaks the association: the same target now appears under many
+    pedestals, so "read the sky off the context" stops minimizing the loss
+    and the only remaining strategy is to subtract whatever pedestal is
+    present. The invariance being trained is f(observed + c) = f(observed).
+
+    A CONSTANT is the physically right shape. The diffuse component varies by
+    1.74x across the whole 2048^2 frame, so over one 64px patch it really is
+    near-constant.
+
+    TWO THINGS THIS CLASS EXISTS TO GET RIGHT
+    -----------------------------------------
+    1. THE OFFSET IS ADDED IN FLUX SPACE, NOT IN THE STORED z DOMAIN. The
+       domain is asinh, so those are not the same operation -- not even
+       close. For m32_klong_nosky, c = 0.01 moves the background (z = 0.15)
+       by +0.188 but a bright peak (z = 0.90) by only +0.0017, a factor of
+       ~110. That compression is exactly what real sky does: it lifts the
+       background and leaves stellar peaks alone. Adding c directly in z
+       would instead brighten every star, which is a different and wrong
+       augmentation.
+
+    2. THE NORMALIZATION IS FROZEN. These params come from the dataset's
+       norm.json once, at construction. They must never be refitted per
+       augmentation: `fit_normalization` derives median and beta FROM the
+       data, so an affine change of the input produces the exact affine
+       image of the transform and (x - median) / beta is invariant -- the
+       offset would cancel and the augmentation would silently do nothing.
+       That is not hypothetical; it is why removing gen_data's global
+       gain/sky step was verified byte-level a no-op (max diff 1.8e-07).
+
+    Note the augmentation only ever ADDS, on top of each patch's native sky,
+    so the training distribution is shifted upward relative to the field. It
+    teaches invariance over [native, native + hi], which is the reachable
+    direction -- there is no way to subtract a pedestal that was never
+    measured per patch.
+
+    Arithmetic mirrors red_pnp_deconvolve.TorchNorm exactly, in float64.
+    """
+
+    def __init__(self, norm_params: dict, lo: float, hi: float):
+        method = norm_params.get("method")
+        if method not in ("asinh", "linear"):
+            sys.exit(f"[sky-aug] unsupported normalization {method!r}; "
+                     f"the flux<->z map is required to place an offset in "
+                     f"flux space")
+        if not 0 < lo <= hi:
+            sys.exit(f"[sky-aug] need 0 < --sky-aug-lo <= --sky-aug-hi, "
+                     f"got {lo} and {hi}")
+        self.method = method
+        self.p = {k: float(v) for k, v in norm_params.items() if k != "method"}
+        self.lo, self.hi = float(lo), float(hi)
+        self.log_lo, self.log_hi = math.log(self.lo), math.log(self.hi)
+
+    def to_flux(self, z):
+        p = self.p
+        if self.method == "asinh":
+            s = z * (p["hi_s"] - p["lo_s"]) + p["lo_s"]
+            return p["median"] + p["beta"] * np.sinh(s)
+        return z * (p["hi"] - p["lo"]) + p["lo"]
+
+    def to_z(self, x):
+        p = self.p
+        if self.method == "asinh":
+            s = np.arcsinh((x - p["median"]) / p["beta"])
+            return (s - p["lo_s"]) / (p["hi_s"] - p["lo_s"])
+        return (x - p["lo"]) / (p["hi"] - p["lo"])
+
+    def draw(self) -> float:
+        """Log-uniform over [lo, hi] -- the pedestal spans 250x, so uniform
+        would put almost every draw in the top decade."""
+        # torch's RNG is seeded per DataLoader worker; numpy's is not.
+        u = float(torch.rand(1).item())
+        return math.exp(self.log_lo + u * (self.log_hi - self.log_lo))
+
+    def apply(self, observed: np.ndarray) -> np.ndarray:
+        z = observed.astype(np.float64)
+        return self.to_z(self.to_flux(z) + self.draw()).astype(np.float32)
+
+    def report(self) -> str:
+        """The z-shift this actually injects, at four brightness levels.
+
+        Printed at setup because the flux->z compression is the whole point
+        and is not something to take on trust.
+        """
+        lines = [f"[sky-aug] flux offset log-uniform in "
+                 f"[{self.lo:.5g}, {self.hi:.5g}]; resulting z shift:",
+                 f"          {'z_in':>6} {'flux':>10}  "
+                 + "  ".join(f"c={c:<8.4g}" for c in (self.lo, self.hi))]
+        for z in (0.15, 0.30, 0.60, 0.90):
+            x = float(self.to_flux(np.float64(z)))
+            shifts = "  ".join(
+                f"{float(self.to_z(np.float64(x + c))) - z:>+10.4f}"
+                for c in (self.lo, self.hi))
+            lines.append(f"          {z:>6.2f} {x:>10.5f}  {shifts}")
+        lines.append("          (background lifts, bright peaks barely move "
+                     "-- that is the asinh doing its job)")
+        return "\n".join(lines)
+
+
 class NpyPairDataset(Dataset):
     """Yields (ideal, observed) tensors straight from the generated arrays.
 
@@ -91,16 +201,21 @@ class NpyPairDataset(Dataset):
     stretch, or otherwise re-map them. Augmentation (if enabled) is a random
     D4 element applied identically to both members of the pair, so the
     observed/ideal registration is preserved.
+
+    `sky_aug` is the one deliberate exception to "values pass through
+    untouched", and it is ASYMMETRIC by design: a random pedestal is added to
+    the observed only, never to the ideal. See SkyAug.
     """
 
     def __init__(self, observed: np.ndarray, ideal: np.ndarray,
-                 augment: bool = False):
+                 augment: bool = False, sky_aug: "SkyAug | None" = None):
         if observed.shape != ideal.shape:
             sys.exit(f"[data] observed {observed.shape} and ideal "
                      f"{ideal.shape} arrays must have identical shapes")
         self.observed = np.ascontiguousarray(observed, dtype=np.float32)
         self.ideal = np.ascontiguousarray(ideal, dtype=np.float32)
         self.augment = augment
+        self.sky_aug = sky_aug
 
     def __len__(self):
         return len(self.observed)
@@ -117,6 +232,10 @@ class NpyPairDataset(Dataset):
             if k >= 4:
                 observed = np.flip(observed, axis=-1)
                 ideal = np.flip(ideal, axis=-1)
+        if self.sky_aug is not None:
+            # Observed only. A constant commutes with D4, so the order here
+            # is presentation, not correctness.
+            observed = self.sky_aug.apply(observed)
         return (
             torch.from_numpy(np.ascontiguousarray(ideal)),
             torch.from_numpy(np.ascontiguousarray(observed)),
@@ -182,13 +301,32 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 
 class FiLMConvBlock(nn.Module):
-    """Conv -> GroupNorm -> FiLM(gamma, beta from t-embedding) -> SiLU."""
+    """Conv -> norm -> FiLM(gamma, beta from t-embedding) -> SiLU.
 
-    def __init__(self, channels: int, dilation: int, t_dim: int):
+    norm="none" replaces the GroupNorm with nn.Identity.  GroupNorm normalizes
+    per-sample over (C/8, H, W), which has two measured costs (see
+    diag_scale_invariance.py):
+
+      * it divides out ABSOLUTE SCALE.  A 4x input reaches blocks.0.norm at
+        std ratio 3.74 and leaves it at 1.005 -- gone at the first block.  What
+        survives arrives only via the residual skip below, and the net responds
+        x2.03 to a x4 input instead of x4.
+      * it makes behaviour depend on H,W.  The same patch run alone vs as a
+        quadrant of a 128x128 mosaic differs by 3.7% over the central region
+        the 41px receptive field cannot see the seam from, so this otherwise
+        fully-convolutional net does not reproduce patch results on a frame.
+
+    Identity is used rather than deleting the attribute so that the same
+    forward hooks (and the same diagnostic) work unchanged on both variants.
+    """
+
+    def __init__(self, channels: int, dilation: int, t_dim: int,
+                 norm: str = "group"):
         super().__init__()
         self.conv = nn.Conv2d(channels, channels, 3,
                               padding=dilation, dilation=dilation)
-        self.norm = nn.GroupNorm(8, channels)
+        self.norm = (nn.GroupNorm(8, channels) if norm == "group"
+                     else nn.Identity())
         self.film = nn.Linear(t_dim, 2 * channels)
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)  # start as identity modulation
@@ -211,8 +349,12 @@ class ConditionalFlatCNN(nn.Module):
 
     DILATIONS = (1, 2, 3, 4, 4, 3, 2, 1)
 
-    def __init__(self, channels: int = 64, t_dim: int = 128):
+    def __init__(self, channels: int = 64, t_dim: int = 128,
+                 norm: str = "group"):
         super().__init__()
+        # Recorded so consumers can rebuild the right variant from a
+        # checkpoint's arch dict; "group" is the pre-flag behaviour.
+        self.norm_kind = norm
         self.t_embed = nn.Sequential(
             SinusoidalTimeEmbedding(t_dim),
             nn.Linear(t_dim, t_dim), nn.SiLU(),
@@ -220,7 +362,7 @@ class ConditionalFlatCNN(nn.Module):
         )
         self.head = nn.Conv2d(2, channels, 3, padding=1)  # 2 in-channels
         self.blocks = nn.ModuleList(
-            FiLMConvBlock(channels, d, t_dim) for d in self.DILATIONS
+            FiLMConvBlock(channels, d, t_dim, norm=norm) for d in self.DILATIONS
         )
         self.tail = nn.Conv2d(channels, 1, 3, padding=1)
         nn.init.zeros_(self.tail.weight)
@@ -375,9 +517,13 @@ def save_checkpoint(path, model, ema, ema_is_lib, optimizer, epoch,
         # flux. Inverting it is the consumer's job.
         "dataset_norm": dataset_norm,
         "data_dir": str(args.data_dir),
+        # "norm" MUST stay in here: a normless checkpoint loaded into a
+        # GroupNorm model has no blocks.*.norm.* keys, and any consumer that
+        # loads with strict=False would silently run a partly-random network.
+        # Absent (pre-flag checkpoints) means "group".
         "arch": {"channels": args.channels,
                  "dilations": list(ConditionalFlatCNN.DILATIONS),
-                 "t_dim": 128, "in_channels": 2},
+                 "t_dim": 128, "in_channels": 2, "norm": args.norm},
         "diffusion": {"timesteps": args.timesteps, "schedule": "cosine"},
         # p_uncond > 0 means model(x_t, zeros, t) is a valid UNCONDITIONAL
         # prior score (classifier-free guidance); consumers should check this
@@ -387,6 +533,13 @@ def save_checkpoint(path, model, ema, ema_is_lib, optimizer, epoch,
         "identity_t_max": args.identity_t_max,
         "low_t_frac": args.low_t_frac,
         "low_t_max": args.low_t_max,
+        # A sky-augmented model was trained to be INVARIANT to an additive
+        # flux pedestal on its conditioning channel. That is a different
+        # function from the un-augmented one, so record it: it is the
+        # explanation a consumer needs when the background floor moves.
+        "sky_aug": ({"lo": args.sky_aug_lo, "hi": args.sky_aug_hi,
+                     "space": "flux", "draw": "log-uniform"}
+                    if args.sky_aug else None),
         "args": {k: (str(v) if isinstance(v, Path) else v)
                  for k, v in vars(args).items()},
     }
@@ -411,6 +564,16 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--timesteps", type=int, default=1000)
     ap.add_argument("--channels", type=int, default=64)
+    ap.add_argument("--norm", choices=["group", "none"], default="group",
+                    help="normalization inside FiLMConvBlock. 'group' is the "
+                         "existing GroupNorm(8, C). 'none' replaces it with "
+                         "Identity: GroupNorm divides out absolute scale at "
+                         "the FIRST block (measured 3.74 in, 1.005 out for a "
+                         "4x input) and makes behaviour depend on H,W (3.7%% "
+                         "difference between a patch run alone and the same "
+                         "patch inside a 128px mosaic). film and tail are "
+                         "already zero-init'd, so the residual stack trains "
+                         "without it. Verify with diag_scale_invariance.py.")
     ap.add_argument("--p-uncond", type=float, default=0.15,
                     help="classifier-free-guidance dropout: fraction of "
                          "training samples whose blurry conditioning is "
@@ -446,6 +609,33 @@ def main():
     ap.add_argument("--no-augment", action="store_true",
                     help="disable the on-the-fly D4 (rot90/flip) pair "
                          "augmentation of the training split.")
+    ap.add_argument("--sky-aug", action="store_true",
+                    help="add a random sky pedestal to the OBSERVED channel "
+                         "only (ideal untouched), teaching the invariance "
+                         "f(observed + c) = f(observed). Targets the "
+                         "background floor: the model currently removes only "
+                         "87%% of each patch's sky and the 13%% it leaves "
+                         "tracks the true sky at r=+0.93, holding the "
+                         "reconstruction's background off zero (bkg0 0.00072 "
+                         "/ zero%% 15.2 vs the truth's 0.00000 / 94.7). The "
+                         "offset is applied in FLUX space through the "
+                         "dataset's FROZEN norm.json -- see SkyAug for why "
+                         "both of those words are load-bearing. Requires "
+                         "norm.json. Train split only; val is never shifted, "
+                         "so val loss stays comparable across runs.")
+    ap.add_argument("--sky-aug-lo", type=float, default=1e-4,
+                    help="low end of the log-uniform flux offset. The default "
+                         "matches the faintest per-patch pedestal measured on "
+                         "the m32 field (0.0001) and is close enough to a "
+                         "no-op that the un-augmented regime stays in the "
+                         "training distribution.")
+    ap.add_argument("--sky-aug-hi", type=float, default=5e-2,
+                    help="high end of the log-uniform flux offset; the "
+                         "default matches the brightest per-patch pedestal "
+                         "measured on the m32 field (0.052). Draws are "
+                         "log-uniform because the range spans 250x and a "
+                         "uniform draw would put nearly every sample in the "
+                         "top decade.")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--overfit-one-batch", action="store_true",
@@ -472,10 +662,8 @@ def main():
 
     # --- data -----------------------------------------------------------
     # Arrays are used exactly as stored: the generator owns the domain.
-    train_ds = NpyPairDataset(*load_split(args.data_dir, "train"),
-                              augment=not args.no_augment)
-    val_ds = NpyPairDataset(*load_split(args.data_dir, "val"), augment=False)
-
+    # norm.json is read BEFORE the datasets are built: --sky-aug needs the
+    # frozen flux<->z map to place its offset in flux space.
     norm_path = args.data_dir / "norm.json"
     if norm_path.exists():
         dataset_norm = json.loads(norm_path.read_text())
@@ -485,6 +673,24 @@ def main():
         print(f"[data] WARNING: no norm.json in {args.data_dir}; checkpoints "
               f"will not carry the normalized->physical map and downstream "
               f"photometry cannot be inverted to flux.")
+
+    sky_aug = None
+    if args.sky_aug:
+        if dataset_norm is None:
+            sys.exit(f"[sky-aug] --sky-aug requires norm.json in "
+                     f"{args.data_dir}: the offset is a FLUX offset and there "
+                     f"is no way to map it into the stored domain without the "
+                     f"generator's transform.")
+        sky_aug = SkyAug(dataset_norm["observed"],
+                         args.sky_aug_lo, args.sky_aug_hi)
+        print(sky_aug.report())
+
+    train_ds = NpyPairDataset(*load_split(args.data_dir, "train"),
+                              augment=not args.no_augment, sky_aug=sky_aug)
+    # val is deliberately NOT sky-shifted: it is the fixed yardstick across
+    # runs, and the effect this augmentation targets is measured end-to-end
+    # by score_recon.py's bkg0/zero% columns, not by val loss.
+    val_ds = NpyPairDataset(*load_split(args.data_dir, "val"), augment=False)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                               shuffle=True, num_workers=args.num_workers,
                               pin_memory=(device.type == "cuda"),
@@ -493,10 +699,11 @@ def main():
                             shuffle=False, num_workers=args.num_workers)
 
     # --- model / optim --------------------------------------------------
-    model = ConditionalFlatCNN(channels=args.channels).to(device)
+    model = ConditionalFlatCNN(channels=args.channels, norm=args.norm).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[model] ConditionalFlatCNN, {n_params/1e6:.2f}M params, "
-          f"dilations {ConditionalFlatCNN.DILATIONS} (41-px receptive field)")
+          f"dilations {ConditionalFlatCNN.DILATIONS} (41-px receptive field), "
+          f"norm={args.norm}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=1e-5)
     ema, ema_is_lib = make_ema(model)
