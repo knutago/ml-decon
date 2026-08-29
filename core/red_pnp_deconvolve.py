@@ -149,6 +149,23 @@ def make_otf(kernel: np.ndarray, shape, device):
     pad = np.zeros((H, W))
     kh, kw = k.shape
     pad[:kh, :kw] = k
+    # The roll assumes the kernel's peak sits at (kh//2, kw//2). For an
+    # EVEN-sized kernel that is off by one whenever the peak is at kh//2 - 1,
+    # which silently translates the whole forward model by a pixel. On
+    # m32b_psf_v2.fits (64x64, peak at (31,31)) that one pixel took the
+    # ef-vs-l160 forward residual from 0.180 to 0.340 and got the file wrongly
+    # written off as an unusable operator. Warn rather than silently recentre:
+    # a deliberately off-centre kernel is a legitimate thing to hand in, and
+    # moving it would change every existing result.
+    py, px = np.unravel_index(int(np.argmax(k)), k.shape)
+    if (py, px) != (kh // 2, kw // 2):
+        import warnings
+        warnings.warn(
+            f"make_otf: kernel peak is at ({py}, {px}) but the FFT centring "
+            f"assumes ({kh // 2}, {kw // 2}); the forward operator will be "
+            f"translated by ({py - kh // 2}, {px - kw // 2}) px. Re-centre the "
+            f"kernel (an odd-sized crop about its peak is the usual fix).",
+            RuntimeWarning, stacklevel=2)
     pad = np.roll(pad, (-(kh // 2), -(kw // 2)), axis=(0, 1))
     # complex128, not complex64: the x-update divides by (|K|^2 + rho) every
     # outer iteration, and psf_50_true's MTF falls to ~2% at the band edge, so
@@ -204,17 +221,33 @@ def model_eps(model, x_t, y_z, tt):
 @torch.no_grad()
 def tweedie_chain(model, z, y_z, t0, n_steps, alpha_bar, guidance=1.0,
                   has_null=False, eta=0.0, generator=None, clamp=(0.0, 0.9),
-                  renoise=False, trace=None, inject_scale=1.0):
+                  renoise=False, trace=None, inject_scale=1.0, eps_fn=None):
     """DDIM reverse chain from t0 down to 0, in the model's normalized domain.
 
     n_steps=1 is the bare Tweedie step  z0 = (x_t - sqrt(1-abar) eps)/sqrt(abar).
-    That step is NOT a usable RED denoiser: measured on blurry input it lifts
-    point-source concentration from 0.067 to only 0.244 at t=5 and ~0.08 at
-    t>=20, because E[x_0 | x_t] at small t is nearly the identity by
-    construction (and this checkpoint's identity_frac term trains it to be
-    exactly that on the sharp manifold). Sharpness in a diffusion model is a
-    property of the ITERATED chain -- the same 250-step chain reaches 0.762.
-    So RED needs n_steps > 1 for D to actually move x toward the prior.
+
+    BUG, found 2026-08-29 and fixed below: until now n_steps=1 did NOT compute
+    that. `np.linspace(0, t0, 1)` returns [0], not [t0], so the single-step
+    path evaluated the model at t=0 -- telling it the input was already clean
+    -- and returned ~0.99*z - 0.0064*eps, a near-identity, for any t0.
+
+    Every "one Tweedie step does not sharpen" result in this repo went through
+    that path and measures the near-identity, NOT Tweedie:
+      - the 0.067 -> 0.244 / ~0.08 numbers this docstring used to quote;
+      - the "flat in t" observation (concentration 0.118 at t=5, 20 AND 60),
+        which the bug predicts exactly -- the only t-dependence left is
+        sqrt(abar[t0]), 0.9998 -> 0.9943, and concentration is scale-blind;
+      - the `RED (1-step) conc 0.621` row in admm_diffusion_deconvolve.py's
+        header table, via compare_solvers.py:210;
+      - the ds1_* arm of admm_sweep_m32.py;
+      - the n_steps=1 rows in diffusion_crash_course.py:1198.
+    All of those need re-measuring before "the chain beats one step" can be
+    claimed again. The chain may still win -- but not for the stated reason,
+    and not by the stated margin.
+
+    Sharpness in a diffusion model is still expected to be a property of the
+    ITERATED chain (a 250-step chain reaches concentration 0.762), so
+    n_steps > 1 remains the default. That claim is now untested at n_steps=1.
 
     The input is scaled as x_t = sqrt(abar_t0) * z rather than having noise
     injected: the RED iterate already carries its own error, and injecting
@@ -260,6 +293,14 @@ def tweedie_chain(model, z, y_z, t0, n_steps, alpha_bar, guidance=1.0,
     LARGE step gaps (few steps over a long range). See --eta's help text in
     admm_diffusion_deconvolve.py, which still states the old claim.
 
+    eps_fn: optional callable (x_t, tt) -> eps, used INSTEAD of the
+    conditional model_eps(model, x_t, y_z, tt). This is what lets an
+    UNCONDITIONAL prior (flat_cnn_diffusion.FlatCNN, eps_theta(x_t, t) with no
+    conditioning channel) run through the identical DDIM/renoise/eta/clamp
+    arithmetic as the conditional one, so a cond-vs-uncond comparison differs
+    only in the network. `guidance` is meaningless without a null token and
+    must be left at 1.0 when eps_fn is given.
+
     trace: optional list. If given, one dict per chain step is appended,
     recording how far z0 moves per step (in normalized units, RMS) and whether
     the deterministic direction term survived. Use it to test whether the late
@@ -278,15 +319,33 @@ def tweedie_chain(model, z, y_z, t0, n_steps, alpha_bar, guidance=1.0,
         # forward diffusion; < 1 is the paper's decoupled regime.
         x_t = x_t + inject_scale * (1 - alpha_bar[int(t0)]).sqrt() * torch.randn(
             z.shape, device=z.device, generator=generator, dtype=dt)
-    grid = np.unique(np.linspace(0, int(t0), max(int(n_steps), 1)).astype(int))[::-1]
-    null = torch.zeros_like(y_z)
+    # n_steps=1 MUST evaluate at t0. np.linspace(0, t0, 1) returns [0] -- only
+    # the start point -- so the old expression queried the model at t=0, told
+    # it the input was already clean, and returned
+    #     z0 = (sqrt(abar[t0]) z - sqrt(1-abar[0]) eps) / sqrt(abar[0])
+    #        ~= 0.99 z - 0.0064 eps
+    # i.e. a near-identity, for ANY t0. That is a scale factor, not a denoise,
+    # and it is why every 1-step measurement on record came out "flat in t":
+    # sqrt(abar[t0]) only moves 0.9998 -> 0.9943 across t0=5..60, and
+    # concentration is blind to a global scale. See the BUG note in the
+    # docstring above -- those numbers do not measure Tweedie.
+    # n_steps>=2 is unaffected (linspace already spans 0..t0), so every tuned
+    # run in the repo is byte-identical across this fix.
+    grid = (np.array([int(t0)]) if int(n_steps) <= 1 else
+            np.unique(np.linspace(0, int(t0), int(n_steps)).astype(int))[::-1])
+    if eps_fn is not None and guidance != 1.0:
+        raise ValueError("guidance != 1 is meaningless with eps_fn (an "
+                         "unconditional network has no null token to guide "
+                         "away from)")
+    null = None if y_z is None else torch.zeros_like(y_z)
     z0_prev = None
 
     for i, t_cur in enumerate(grid):
         ab_t = alpha_bar[int(t_cur)]
         tt = torch.full((z.shape[0],), int(t_cur), device=z.device,
                         dtype=torch.long)
-        eps = model_eps(model, x_t, y_z, tt)
+        eps = (eps_fn(x_t, tt) if eps_fn is not None
+               else model_eps(model, x_t, y_z, tt))
         if guidance != 1.0:
             if not has_null:
                 raise ValueError("--guidance != 1 needs a checkpoint trained "
@@ -378,8 +437,12 @@ def load_checkpoint(path, device, weights="ema", dtype=torch.float32):
             "(trainer-side asinh transform). This script only supports the "
             "rewritten trainer's checkpoints.")
     arch = ck.get("arch", {})
+    # "norm" is absent from every checkpoint written before the trainer's
+    # --norm flag existed, and those are all GroupNorm -- so the default keeps
+    # existing checkpoints loading exactly as before.
     model = ConditionalFlatCNN(channels=arch.get("channels", 64),
-                               t_dim=arch.get("t_dim", 128)).to(device)
+                               t_dim=arch.get("t_dim", 128),
+                               norm=arch.get("norm", "group")).to(device)
     state_key = "ema_state" if (weights == "ema" and "ema_state" in ck) \
         else "model_state"
     state = ck[state_key]
@@ -434,10 +497,57 @@ def shared_norm(ref, vmax=None):
                      vmax=float(ref.max()) if vmax is None else float(vmax))
 
 
+def row_norm(panels):
+    """One asinh stretch for a whole row, set by the row's BACKGROUND scale.
+
+    This is the stretch to use on m32. Both alternatives are broken here:
+
+    `shared_norm(truth)` sets linear_width = max(sig_std(truth), 1e-30), and
+    an m32 ideal patch is a point-source catalogue on an EXACTLY-zero
+    background -- sig_std is 0.0, the width collapses to 1e-30, and asinh
+    degenerates into a step function at zero. Every panel then renders pure
+    black and white and conveys only "is this pixel nonzero".
+
+    A per-panel stretch (show()'s norm=None, or panel_norm) fails the other
+    way. Only the truth's width is degenerate, so the truth takes the
+    p99.9/100 fallback while every reconstruction takes its own sig_std --
+    the truth is drawn with a ~3x larger linear width, up to ~20x on the
+    sparse patches. Its background is crushed to black while the recon's
+    identical-magnitude background is stretched into visible texture, which
+    reads unmistakably as "this solver is fuzzy" for a solver that is not.
+    (Measured: sig_std 0.00209 for the ADMM against 0.00258 for the truth --
+    the ADMM background is genuinely QUIETER and still renders noisier.)
+
+    So: give every panel in the row ONE width. But do not take it from the
+    row's bright end (p99.9/100) -- that was the first attempt and it errs in
+    the other direction. On the dense patches it lands 10-38x above the
+    background scale, which compresses genuine faint sources to black: idx
+    1222 and 1410 have 953 and 540 nonzero truth pixels, and a width of 0.137
+    renders essentially all of them as background.
+
+    Take it instead from the background scale the panels actually share --
+    the median of the well-defined sigma-clipped stds. That resolves the
+    faint regime, which is the regime these figures exist to compare, and is
+    identical for every panel so the comparison stays honest. vmax is common
+    too, so brightness is comparable across the row.
+
+    Pass the panels that share a scale. Exclude the OBSERVED one: it is
+    blurred and sits at a different peak, so it drags the width off the
+    reconstruction/truth scale. Give that its own `panel_norm`.
+    """
+    ws = [float(sig_std(p)) for p in panels]
+    ws = [w for w in ws if np.isfinite(w) and w > 0]
+    hi = max(max(float(np.percentile(p, 99.9)) for p in panels), 1e-30)
+    w = float(np.median(ws)) if ws else hi / 1000.0
+    return AsinhNorm(linear_width=w, vmin=0.0, vmax=hi)
+
+
 def show(ax, img, title, norm=None):
     """`norm=None` keeps the old per-panel stretch (every existing caller).
 
-    Pass a `shared_norm(truth)` to make panels comparable by eye.
+    On m32 point-source data that default is WRONG for the truth panel --
+    sig_std is exactly 0 there, so the stretch becomes a black/white step.
+    Pass a `row_norm([...])` instead; see its docstring.
     """
     if norm is None:
         norm = AsinhNorm(linear_width=max(sig_std(img), 1e-30),
