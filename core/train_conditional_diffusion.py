@@ -376,6 +376,185 @@ class ConditionalFlatCNN(nn.Module):
         return self.tail(h)
 
 
+class ResBlock(nn.Module):
+    """U-Net residual block. Zero-init second conv => starts as identity.
+
+    Ported from train_psf_conditional_diffusion.py with the PSF conditioning
+    removed; `cond` here is the time embedding alone.
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, cond_dim: int,
+                 norm: str = "none"):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(8, in_ch) if norm == "group" else nn.Identity()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.film = nn.Linear(cond_dim, 2 * out_ch)
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
+        self.norm2 = nn.GroupNorm(8, out_ch) if norm == "group" else nn.Identity()
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+        self.skip = (nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch
+                     else nn.Identity())
+
+    def forward(self, x, cond):
+        h = self.conv1(F.silu(self.norm1(x)))
+        gamma, beta = self.film(cond).chunk(2, dim=-1)
+        h = h * (1 + gamma[:, :, None, None]) + beta[:, :, None, None]
+        h = self.conv2(F.silu(self.norm2(h)))
+        return h + self.skip(x)
+
+
+class ConditionalUNet(nn.Module):
+    """Downsampling denoiser, drop-in for ConditionalFlatCNN.
+
+    Same contract: forward(x_t, y_cond, t) -> predicted eps, 2 input channels,
+    zero-init tail. Ported from PsfConditionalUNet with the PSF encoder,
+    cross-attention and psf_map channel stripped out, so the ONLY difference
+    from the flat control is the backbone.
+
+    WHY IT MIGHT WIN. The flat stack's dilation pyramid gives a 41-px receptive
+    field. The bottleneck here sees the whole 64-px patch. The one place that
+    should matter on m32 is the sky leak -- the model leaks 13% of each patch's
+    sky into its sources, and a 41-px window genuinely cannot tell a smooth
+    pedestal from faint extended flux. That is the metric that would justify
+    this arch; not val loss, and not completeness.
+
+    WHY IT MIGHT LOSE, stated in advance so the result is falsifiable:
+
+      * The zero floor. The whole normless finding is an EXACTLY-zero
+        background (72.3% of pixels). Every output pixel here is a blend of
+        upsampled features, so exact zeros are much less likely to survive.
+        PREDICTION: zero% comes in BELOW the flat CNN's. If it does not, that
+        is the interesting result.
+      * Shift-equivariance. Stride-2 convs are equivariant only to EVEN
+        translations, so a source sits at a different phase relative to the
+        pooling grid in a 64-px patch than in the 512-px frame. The flat CNN's
+        patchwise/global agreement (fwd_resid 0.1762 vs 0.1705) is a property
+        of that arch and should not be expected to carry over.
+      * Size divisibility. len(ch_mult)=3 means H,W must be divisible by 4.
+        64 and 512 both are; an odd crop would not be.
+
+    Nearest-neighbour upsampling (not transposed conv) avoids checkerboard
+    artifacts, which on a star field would be indistinguishable from faint
+    sources.
+    """
+
+    # Defaults are PARAM-MATCHED to ConditionalFlatCNN(channels=64): 498k vs
+    # 462k (1.08x). A closer fit exists at base=12, ch_mult=(1,2,4),
+    # blocks_per_level=1 (451k, 0.97x) but chans would be 12/24/48 and
+    # GroupNorm(8, 12) is invalid, so the --norm group ablation could not run.
+    # Every channel count here (16/32/32) is divisible by 8.
+    def __init__(self, base: int = 16, ch_mult=(1, 2, 2), t_dim: int = 128,
+                 norm: str = "none", blocks_per_level: int = 2):
+        super().__init__()
+        self.norm_kind = norm
+        self.base = base
+        self.ch_mult = tuple(ch_mult)
+        self.blocks_per_level = blocks_per_level
+        self.t_embed = nn.Sequential(
+            SinusoidalTimeEmbedding(t_dim),
+            nn.Linear(t_dim, t_dim), nn.SiLU(),
+            nn.Linear(t_dim, t_dim),
+        )
+        chans = [base * m for m in self.ch_mult]
+        self.head = nn.Conv2d(2, chans[0], 3, padding=1)  # [x_t, y_cond]
+
+        self.down = nn.ModuleList()
+        self.downsample = nn.ModuleList()
+        skip_chans = [chans[0]]
+        cur = chans[0]
+        for li, ch in enumerate(chans):
+            level = nn.ModuleList()
+            for _ in range(blocks_per_level):
+                level.append(ResBlock(cur, ch, t_dim, norm=norm))
+                cur = ch
+                skip_chans.append(cur)
+            self.down.append(level)
+            if li < len(chans) - 1:
+                self.downsample.append(nn.Conv2d(cur, cur, 3, stride=2,
+                                                 padding=1))
+                skip_chans.append(cur)
+            else:
+                self.downsample.append(None)
+
+        self.mid1 = ResBlock(cur, cur, t_dim, norm=norm)
+        self.mid2 = ResBlock(cur, cur, t_dim, norm=norm)
+
+        self.up = nn.ModuleList()
+        self.upsample = nn.ModuleList()
+        for li, ch in reversed(list(enumerate(chans))):
+            level = nn.ModuleList()
+            for _ in range(blocks_per_level + 1):
+                level.append(ResBlock(cur + skip_chans.pop(), ch, t_dim,
+                                      norm=norm))
+                cur = ch
+            self.up.append(level)
+            self.upsample.append(nn.Conv2d(cur, cur, 3, padding=1)
+                                 if li > 0 else None)
+
+        self.tail = nn.Conv2d(cur, 1, 3, padding=1)
+        nn.init.zeros_(self.tail.weight)
+        nn.init.zeros_(self.tail.bias)
+
+    def forward(self, x_t, y_cond, t):
+        cond = self.t_embed(t)
+        z = self.head(torch.cat([x_t, y_cond], dim=1))
+        skips = [z]
+        for level, ds in zip(self.down, self.downsample):
+            for block in level:
+                z = block(z, cond)
+                skips.append(z)
+            if ds is not None:
+                z = ds(z)
+                skips.append(z)
+
+        z = self.mid1(z, cond)
+        z = self.mid2(z, cond)
+
+        for level, us in zip(self.up, self.upsample):
+            for block in level:
+                z = block(torch.cat([z, skips.pop()], dim=1), cond)
+            if us is not None:
+                z = us(F.interpolate(z, scale_factor=2, mode="nearest"))
+        return self.tail(z)
+
+
+def build_model(kind: str, **kw) -> nn.Module:
+    """Single construction point for both architectures.
+
+    Consumers MUST go through this (or model_from_checkpoint) rather than
+    naming a class: guessing the arch wrong gives either a load error or, with
+    strict=False anywhere, a silently partly-random network.
+    """
+    if kind == "flat":
+        kw.pop("base", None); kw.pop("ch_mult", None)
+        kw.pop("blocks_per_level", None)
+        return ConditionalFlatCNN(**kw)
+    if kind == "unet":
+        kw.pop("channels", None)
+        return ConditionalUNet(**kw)
+    raise SystemExit(f"[model] unknown arch {kind!r}")
+
+
+def model_from_checkpoint(ckpt: dict) -> nn.Module:
+    """Rebuild the exact architecture a checkpoint was trained with.
+
+    `kind` is absent from every pre-flag checkpoint and those are all flat, so
+    the default preserves existing behaviour exactly -- the same convention
+    `norm` already uses.
+    """
+    a = dict(ckpt.get("arch", {}))
+    kind = a.pop("kind", "flat")
+    a.pop("in_channels", None)
+    a.pop("dilations", None)
+    a.setdefault("norm", "group")   # pre-flag checkpoints are GroupNorm
+    if kind == "unet" and isinstance(a.get("ch_mult"), list):
+        a["ch_mult"] = tuple(a["ch_mult"])
+    return build_model(kind, **a)
+
+
 # ----------------------------------------------------------------------------
 # EMA (uses ema_pytorch if installed, else a minimal fallback)
 # ----------------------------------------------------------------------------
@@ -521,9 +700,20 @@ def save_checkpoint(path, model, ema, ema_is_lib, optimizer, epoch,
         # GroupNorm model has no blocks.*.norm.* keys, and any consumer that
         # loads with strict=False would silently run a partly-random network.
         # Absent (pre-flag checkpoints) means "group".
-        "arch": {"channels": args.channels,
-                 "dilations": list(ConditionalFlatCNN.DILATIONS),
-                 "t_dim": 128, "in_channels": 2, "norm": args.norm},
+        # "kind" MUST stay in here for the same reason "norm" does: a unet
+        # state_dict loaded into a flat CNN shares almost no keys, and any
+        # consumer using strict=False would run a nearly-random network.
+        # Absent (pre-flag checkpoints) means "flat", as absent norm means
+        # "group". Only the keys the chosen arch actually takes are written,
+        # so build_model never receives a value it would have to guess at.
+        "arch": ({"kind": "flat", "channels": args.channels,
+                  "dilations": list(ConditionalFlatCNN.DILATIONS),
+                  "t_dim": 128, "in_channels": 2, "norm": args.norm}
+                 if args.arch == "flat" else
+                 {"kind": "unet", "base": args.base,
+                  "ch_mult": [int(v) for v in args.ch_mult.split(",")],
+                  "blocks_per_level": args.blocks_per_level,
+                  "t_dim": 128, "in_channels": 2, "norm": args.norm}),
         "diffusion": {"timesteps": args.timesteps, "schedule": "cosine"},
         # p_uncond > 0 means model(x_t, zeros, t) is a valid UNCONDITIONAL
         # prior score (classifier-free guidance); consumers should check this
@@ -563,7 +753,26 @@ def main():
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--timesteps", type=int, default=1000)
-    ap.add_argument("--channels", type=int, default=64)
+    ap.add_argument("--channels", type=int, default=64,
+                    help="flat arch: width of every block.")
+    ap.add_argument("--arch", choices=["flat", "unet"], default="flat",
+                    help="'flat' is the dilated stack every previous result "
+                         "was measured on: 41-px receptive field, no "
+                         "downsampling, shift-equivariant, applies unchanged "
+                         "to a whole frame. 'unet' downsamples so its "
+                         "bottleneck sees the entire patch. Defaults are "
+                         "param-matched (462k vs 498k) so a win cannot be "
+                         "capacity. Compare on photometry and the sky-leak "
+                         "slope, NOT on val loss -- the two archs do not have "
+                         "the same loss landscape.")
+    ap.add_argument("--base", type=int, default=16,
+                    help="unet arch: width at full resolution.")
+    ap.add_argument("--ch-mult", type=str, default="1,2,2",
+                    help="unet arch: per-level channel multipliers. Length "
+                         "sets the number of levels, so H,W must be divisible "
+                         "by 2**(len-1).")
+    ap.add_argument("--blocks-per-level", type=int, default=2,
+                    help="unet arch: ResBlocks per encoder level.")
     ap.add_argument("--norm", choices=["group", "none"], default="group",
                     help="normalization inside FiLMConvBlock. 'group' is the "
                          "existing GroupNorm(8, C). 'none' replaces it with "
@@ -699,11 +908,23 @@ def main():
                             shuffle=False, num_workers=args.num_workers)
 
     # --- model / optim --------------------------------------------------
-    model = ConditionalFlatCNN(channels=args.channels, norm=args.norm).to(device)
+    ch_mult = tuple(int(v) for v in args.ch_mult.split(","))
+    model = build_model(args.arch, channels=args.channels, norm=args.norm,
+                        base=args.base, ch_mult=ch_mult,
+                        blocks_per_level=args.blocks_per_level).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[model] ConditionalFlatCNN, {n_params/1e6:.2f}M params, "
-          f"dilations {ConditionalFlatCNN.DILATIONS} (41-px receptive field), "
-          f"norm={args.norm}")
+    if args.arch == "flat":
+        print(f"[model] ConditionalFlatCNN, {n_params/1e6:.3f}M params, "
+              f"dilations {ConditionalFlatCNN.DILATIONS} (41-px receptive "
+              f"field), norm={args.norm}")
+    else:
+        div = 2 ** (len(ch_mult) - 1)
+        print(f"[model] ConditionalUNet, {n_params/1e6:.3f}M params, base "
+              f"{args.base}, ch_mult {ch_mult}, {args.blocks_per_level} "
+              f"blocks/level, norm={args.norm}")
+        print(f"[model] H,W must be divisible by {div}. Downsampling is NOT "
+              f"shift-equivariant, so patchwise and whole-frame inference are "
+              f"no longer expected to agree the way the flat arch does.")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=1e-5)
     ema, ema_is_lib = make_ema(model)

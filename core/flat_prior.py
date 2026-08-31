@@ -170,20 +170,19 @@ class CondM31Prior:
 
     def __init__(self, ckpt_path, flux_scale=1.0, cond_divisor=None,
                  device=None, weights="ema", dtype=torch.float32, verbose=True):
-        from train_conditional_diffusion import ConditionalFlatCNN, cosine_alpha_bar
+        from train_conditional_diffusion import (cosine_alpha_bar,
+                                                 model_from_checkpoint)
         self.device = device or torch.device("cpu")
         ck = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         if "transform" not in ck:
             raise SystemExit(f"{ckpt_path}: no 'transform' -- this is a "
                              "dataset_norm checkpoint; run it with --prior cond")
-        arch = ck["arch"]
-        # norm must come from the checkpoint's arch: a net trained with
-        # --norm none has nn.Identity where GroupNorm's affine parameters would
-        # be, so rebuilding the wrong variant fails the strict load. Absent
-        # (pre-flag checkpoints) means "group".
-        self.model = ConditionalFlatCNN(channels=arch["channels"],
-                                        t_dim=arch.get("t_dim", 128),
-                                        norm=arch.get("norm", "group")).to(self.device)
+        # arch (both "kind" and "norm") must come from the checkpoint: a net
+        # trained with --norm none has nn.Identity where GroupNorm's affine
+        # parameters would be, and a unet shares almost no keys with the flat
+        # stack, so rebuilding the wrong variant fails the strict load. Absent
+        # means flat/group -- i.e. every pre-flag checkpoint.
+        self.model = model_from_checkpoint(ck).to(self.device)
         state = (ck.get("ema_state") if weights == "ema" else None) \
             or ck.get("model_state") or ck.get("model")
         self.model.load_state_dict(state)

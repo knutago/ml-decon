@@ -54,7 +54,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from train_conditional_diffusion import ConditionalFlatCNN, cosine_alpha_bar
+from train_conditional_diffusion import (ConditionalFlatCNN, cosine_alpha_bar,
+                                         model_from_checkpoint)
 
 DATA = Path("/home/alex/noir_ml/global/ml-decon/data/m31bK50")
 
@@ -71,8 +72,7 @@ def load_model(ckpt_path: Path, device):
     # with strict=False would silently run a partly-random network -- hence
     # every load_state_dict below is strict.
     norm = arch.get("norm", "group")
-    model = ConditionalFlatCNN(channels=arch.get("channels", 64),
-                               t_dim=arch.get("t_dim", 128), norm=norm)
+    model = model_from_checkpoint(ck)
     state, which = ck.get("ema_state"), "ema"
     if state is None:
         state, which = ck["model_state"], "model"
@@ -90,9 +90,10 @@ def load_model(ckpt_path: Path, device):
     return model, ck
 
 
-def load_pairs(n: int, seed: int = 0):
-    obs = np.load(DATA / "val_observed.npy", mmap_mode="r")
-    ide = np.load(DATA / "val_ideal.npy", mmap_mode="r")
+def load_pairs(n: int, seed: int = 0, data_dir: Path = None):
+    d = Path(data_dir) if data_dir is not None else DATA
+    obs = np.load(d / "val_observed.npy", mmap_mode="r")
+    ide = np.load(d / "val_ideal.npy", mmap_mode="r")
     idx = np.random.default_rng(seed).choice(len(obs), size=n, replace=False)
     idx.sort()
     y = torch.from_numpy(np.ascontiguousarray(obs[idx])).float()
@@ -167,7 +168,15 @@ def test_b(model, x0, y, alpha_bar, device, t_int=500, c=4.0):
     attributed.  Scaling (x_t, y) jointly makes the input std ratio exactly c
     by construction, so any collapse below c is the network's doing.
     """
-    kinds = sorted({type(blk.norm).__name__ for blk in model.blocks})
+    # Collected by NAME rather than via model.blocks: the flat stack keeps one
+    # `.norm` per FiLMConvBlock, the unet keeps `.norm1`/`.norm2` per ResBlock
+    # inside down/mid/up, and this test has to run on both to be worth having.
+    norms = [(n, m) for n, m in model.named_modules()
+             if n.rsplit(".", 1)[-1] in ("norm", "norm1", "norm2")]
+    if not norms:
+        print("[test B] no norm layers found -- nothing to hook")
+        return
+    kinds = sorted({type(m).__name__ for _, m in norms})
     print("\n" + "=" * 74)
     print(f"TEST B: where does scale information die?  (t={t_int}, input x {c:g})")
     print("  ratio = std(activations at c) / std(activations at c=1)")
@@ -190,8 +199,7 @@ def test_b(model, x0, y, alpha_bar, device, t_int=500, c=4.0):
             rec[name] = (float(inp[0].std()), float(outp.std()))
         return hook
 
-    handles = [blk.norm.register_forward_hook(mk_hook(f"blocks.{i}.norm"))
-               for i, blk in enumerate(model.blocks)]
+    handles = [m.register_forward_hook(mk_hook(n)) for n, m in norms]
 
     xt_base = s_ab * x0 + s_1mab * eps
     runs = {}
@@ -281,6 +289,13 @@ def main():
     ap.add_argument("--ckpt", type=Path, default=Path("checkpoints_cond_diffusion/best.pt"))
     ap.add_argument("--n", type=int, default=64, help="number of val patches")
     ap.add_argument("--seed", type=int, default=0)
+    # The patches MUST come from the field the checkpoint was trained on:
+    # every dataset's norm.json sets its own flux scale (f555's beta is 100.15
+    # against m31bK50's), so feeding a checkpoint another dataset's z values is
+    # an out-of-domain test, not a scale test.
+    ap.add_argument("--data-dir", type=Path, default=None,
+                    help=f"val patches to probe with (default {DATA}). Match "
+                         f"it to the checkpoint's own data_dir.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -292,8 +307,8 @@ def main():
     if isinstance(alpha_bar, tuple):
         alpha_bar = alpha_bar[0]
 
-    x0, y = load_pairs(args.n, args.seed)
-    print(f"data: {DATA}  n={args.n}  "
+    x0, y = load_pairs(args.n, args.seed, args.data_dir)
+    print(f"data: {args.data_dir or DATA}  n={args.n}  "
           f"x0 range [{float(x0.min()):.4f}, {float(x0.max()):.4f}]  "
           f"y range [{float(y.min()):.4f}, {float(y.max()):.4f}]")
 
