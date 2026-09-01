@@ -335,6 +335,13 @@ def load_sources(specs, split: str, psf_size: int, psf_repr: str):
         observed = np.load(data_dir / f"{split}_observed.npy")
         ideal = np.load(data_dir / f"{split}_ideal.npy")
         tag = data_dir.name
+        if len(observed) == 0:
+            # gen_psf_bank_data.py writes holdout dirs with an EMPTY train
+            # split on purpose, so a holdout PSF cannot reach the optimizer.
+            # Skipping quietly would hide a mis-globbed --data-dir, so say so.
+            print(f"[data] {split}/{tag}: 0 patches, skipped (holdout dirs "
+                  f"carry no train split by design)")
+            continue
         print(f"[data] {split}/{tag}: {len(observed)} pairs "
               f"{tuple(observed.shape[1:])}  "
               f"observed[{observed.min():+.4f}, {observed.max():+.4f}]  "
@@ -953,6 +960,14 @@ def main():
                          "DIR:PSF_PATH to name the PSF explicitly. Mixing "
                          "dirs is the point: PSF variety in training is what "
                          "removes the retrain-per-PSF requirement.")
+    ap.add_argument("--val-data-dir", type=str, nargs="*",
+                    help="validate on THESE dirs instead of the val split of "
+                         "--data-dir. This is the only split that tests the "
+                         "claim the model exists for: --data-dir's own val "
+                         "split shares its PSFs with train, so a good score "
+                         "there says nothing about a NEW PSF. Point this at "
+                         "gen_psf_bank_data.py's holdout_* dirs, whose PSFs "
+                         "appear nowhere in training.")
     ap.add_argument("--checkpoint-dir", type=Path,
                     default=Path("checkpoints_psf_cond"))
     ap.add_argument("--epochs", type=int, default=100)
@@ -1105,8 +1120,20 @@ def main():
     # Arrays are used exactly as stored: the generator owns the domain.
     train_sources, norms = load_sources(args.data_dir, "train",
                                         args.psf_size, args.psf_repr)
-    val_sources, _ = load_sources(args.data_dir, "val",
-                                  args.psf_size, args.psf_repr)
+    if args.val_data_dir:
+        val_sources, val_norms = load_sources(args.val_data_dir, "val",
+                                              args.psf_size, args.psf_repr)
+        norms = {**norms, **val_norms}
+        print(f"[data] HELD-OUT PSF validation: val PSFs come from "
+              f"{len(val_sources)} dir(s) disjoint from training. This val "
+              f"loss measures generalization to an UNSEEN beam.")
+    else:
+        val_sources, _ = load_sources(args.data_dir, "val",
+                                      args.psf_size, args.psf_repr)
+        print(f"[data] NOTE: validating on the spatial val split of the "
+              f"TRAINING dirs, so every val PSF was also seen in training. "
+              f"That number does not test transfer to a new PSF -- use "
+              f"--val-data-dir with held-out PSFs for that.")
     warn_on_mixed_norms(norms)
 
     train_ds = PsfPairDataset(train_sources, augment=not args.no_augment)
@@ -1231,6 +1258,17 @@ def main():
         return
 
     # --- full training loop ---------------------------------------------
+    # The two reported losses are NOT the same quantity and must never be
+    # compared to each other. Training applies the loss shaping
+    # (--low-t-frac, --identity-frac), which deliberately concentrates the
+    # batch in the hardest low-t regime; validate() uses plain uniform t. So
+    # val sitting well below train is an artifact of the sampling, not
+    # evidence of generalization. Only val-vs-val across epochs and across
+    # checkpoints is meaningful -- which is what best.pt selects on.
+    print(f"[loss] 'train' is shaped (low_t_frac={args.low_t_frac}, "
+          f"identity_frac={args.identity_frac}); 'val' is uniform-t. They are "
+          f"different quantities -- compare val across runs, never val "
+          f"against train.")
     best_val = float("inf")
     model.train()
     for epoch in range(1, args.epochs + 1):
@@ -1259,8 +1297,8 @@ def main():
         train_loss = running / max(n_seen, 1)
         val_loss = validate(model, val_loader, alpha_bar, device)
         dt = time.time() - t0
-        print(f"[epoch {epoch:3d}/{args.epochs}] train {train_loss:.5f}  "
-              f"val {val_loss:.5f}  ({dt:.1f}s)")
+        print(f"[epoch {epoch:3d}/{args.epochs}] train(shaped) {train_loss:.5f}"
+              f"  val(uniform-t) {val_loss:.5f}  ({dt:.1f}s)")
 
         save_checkpoint(args.checkpoint_dir / "last.pt", model, ema,
                         ema_is_lib, optimizer, epoch, norms, arch_cfg, args)
