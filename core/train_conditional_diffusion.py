@@ -349,12 +349,21 @@ class ConditionalFlatCNN(nn.Module):
 
     DILATIONS = (1, 2, 3, 4, 4, 3, 2, 1)
 
+    @staticmethod
+    def receptive_field(dilations) -> int:
+        """head(3x3) + one 3x3 per dilated block + tail(3x3)."""
+        return 1 + 2 + 2 * sum(dilations) + 2
+
     def __init__(self, channels: int = 64, t_dim: int = 128,
-                 norm: str = "group"):
+                 norm: str = "group", dilations=None):
         super().__init__()
         # Recorded so consumers can rebuild the right variant from a
-        # checkpoint's arch dict; "group" is the pre-flag behaviour.
+        # checkpoint's arch dict; "group" is the pre-flag behaviour, and the
+        # class-constant default is the pyramid every earlier result was
+        # measured on.
         self.norm_kind = norm
+        self.dilations = tuple(self.DILATIONS if dilations is None
+                               else dilations)
         self.t_embed = nn.Sequential(
             SinusoidalTimeEmbedding(t_dim),
             nn.Linear(t_dim, t_dim), nn.SiLU(),
@@ -362,7 +371,8 @@ class ConditionalFlatCNN(nn.Module):
         )
         self.head = nn.Conv2d(2, channels, 3, padding=1)  # 2 in-channels
         self.blocks = nn.ModuleList(
-            FiLMConvBlock(channels, d, t_dim, norm=norm) for d in self.DILATIONS
+            FiLMConvBlock(channels, d, t_dim, norm=norm)
+            for d in self.dilations
         )
         self.tail = nn.Conv2d(channels, 1, 3, padding=1)
         nn.init.zeros_(self.tail.weight)
@@ -521,6 +531,18 @@ class ConditionalUNet(nn.Module):
         return self.tail(z)
 
 
+def parse_dilations(spec) -> tuple:
+    """'1,2,3,4' -> (1,2,3,4). Accepts a sequence unchanged."""
+    if spec is None:
+        return ConditionalFlatCNN.DILATIONS
+    if isinstance(spec, str):
+        spec = [v for v in spec.replace(" ", "").split(",") if v]
+    out = tuple(int(v) for v in spec)
+    if not out or any(d < 1 for d in out):
+        raise SystemExit(f"[model] --dilations must be positive ints, got {spec!r}")
+    return out
+
+
 def build_model(kind: str, **kw) -> nn.Module:
     """Single construction point for both architectures.
 
@@ -533,7 +555,7 @@ def build_model(kind: str, **kw) -> nn.Module:
         kw.pop("blocks_per_level", None)
         return ConditionalFlatCNN(**kw)
     if kind == "unet":
-        kw.pop("channels", None)
+        kw.pop("channels", None); kw.pop("dilations", None)
         return ConditionalUNet(**kw)
     raise SystemExit(f"[model] unknown arch {kind!r}")
 
@@ -548,7 +570,12 @@ def model_from_checkpoint(ckpt: dict) -> nn.Module:
     a = dict(ckpt.get("arch", {}))
     kind = a.pop("kind", "flat")
     a.pop("in_channels", None)
-    a.pop("dilations", None)
+    # "dilations" used to be dropped here because the pyramid was a class
+    # constant. It is a constructor argument now, so it MUST be passed
+    # through: dropping it would silently rebuild a wide-receptive-field
+    # checkpoint as the 41-px default and load a mismatched state_dict.
+    # Pre-flag checkpoints already record the default pyramid, so passing it
+    # is exactly equivalent for them.
     a.setdefault("norm", "group")   # pre-flag checkpoints are GroupNorm
     if kind == "unet" and isinstance(a.get("ch_mult"), list):
         a["ch_mult"] = tuple(a["ch_mult"])
@@ -707,7 +734,7 @@ def save_checkpoint(path, model, ema, ema_is_lib, optimizer, epoch,
         # "group". Only the keys the chosen arch actually takes are written,
         # so build_model never receives a value it would have to guess at.
         "arch": ({"kind": "flat", "channels": args.channels,
-                  "dilations": list(ConditionalFlatCNN.DILATIONS),
+                  "dilations": list(parse_dilations(args.dilations)),
                   "t_dim": 128, "in_channels": 2, "norm": args.norm}
                  if args.arch == "flat" else
                  {"kind": "unet", "base": args.base,
@@ -753,6 +780,18 @@ def main():
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--timesteps", type=int, default=1000)
+    ap.add_argument("--dilations", default=None,
+                    help="flat arch: comma-separated dilation pyramid. "
+                         "Receptive field is 5 + 2*sum(dilations); the "
+                         "default 1,2,3,4,4,3,2,1 gives 41 px on a 64-px "
+                         "patch, so the corners of a patch never influence "
+                         "each other. Widening it (e.g. 1,2,3,4,6,8,6,4,3,2,1 "
+                         "-> 85 px) is the flat arch's only receptive-field "
+                         "knob and is the honest alternative to switching to "
+                         "a U-Net: it buys long-range context WITHOUT "
+                         "downsampling, which is what the point-source "
+                         "statistics object to. Costs params linearly in "
+                         "depth, nothing in resolution.")
     ap.add_argument("--channels", type=int, default=64,
                     help="flat arch: width of every block.")
     ap.add_argument("--arch", choices=["flat", "unet"], default="flat",
@@ -910,12 +949,15 @@ def main():
     # --- model / optim --------------------------------------------------
     ch_mult = tuple(int(v) for v in args.ch_mult.split(","))
     model = build_model(args.arch, channels=args.channels, norm=args.norm,
+                        dilations=parse_dilations(args.dilations),
                         base=args.base, ch_mult=ch_mult,
                         blocks_per_level=args.blocks_per_level).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     if args.arch == "flat":
+        dil = parse_dilations(args.dilations)
         print(f"[model] ConditionalFlatCNN, {n_params/1e6:.3f}M params, "
-              f"dilations {ConditionalFlatCNN.DILATIONS} (41-px receptive "
+              f"dilations {dil} "
+              f"({ConditionalFlatCNN.receptive_field(dil)}-px receptive "
               f"field), norm={args.norm}")
     else:
         div = 2 ** (len(ch_mult) - 1)
