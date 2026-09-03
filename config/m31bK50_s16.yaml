@@ -1,0 +1,52 @@
+# m31bK50, regenerated at stride 16 for the 2026-09 retrain.
+#
+# WHY REGENERATE AT ALL. data/m31bK50 was built 2026-08-06 by a gen_data.py that
+# predates both `crop` and `fit_photometry` -- its resolved_config.yaml has
+# neither key -- so "what code produced the training data" is not answerable for
+# any checkpoint trained on it. This config pins it under today's code. It
+# writes to a NEW directory; data/m31bK50 is left alone because the retired
+# numbers in CLAUDE.md came from it.
+#
+# WHAT CHANGES, AND WHAT IT IS AND IS NOT WORTH
+#   stride 32 -> 16 takes 125x125 = 15625 patches to 249x249 = 62001 (~4.4x).
+#   This is NOT 4.4x more information -- the patches overlap 75% and a conv net
+#   is already translation-equivariant, so the added diversity is sub-patch
+#   phase and patch-boundary context, not new sky. It is worth taking anyway
+#   for the wide arm: 4.23M parameters against 14153 patches is the regime
+#   where the flat stack can memorize, and patches are free.
+#
+# WHAT DOES NOT CHANGE
+#   fit_photometry: true is the DEFAULT and matches what the Aug-6 build did
+#   (CLAUDE.md 6.1: "stores (observed - sky)/gain"). It is also very nearly a
+#   no-op on the encoded patches -- fit_normalization derives median and beta
+#   from the data, so an affine change of the input gives the exact affine
+#   image of the transform and (x - median)/beta is invariant. Stated here so
+#   nobody re-derives it.
+#
+#   crop: null. Unlike the M31f11 frames, m31bK50_trim.fits is 0.00% exactly
+#   zero over the full 4040^2 -- there is no padding to trim. (The ideal is
+#   7.23% zero, but those are real empty-sky pixels, not padding.)
+#
+# THE FIELD'S TWO RELEVANT PROPERTIES, measured, because they bound what the
+# m32-era fixes can buy here:
+#   ideal is 7.23% exact zeros / 92.77% populated -- a real unresolved-flux
+#     floor, not a catalogue rendering. There is no zero floor for --norm none
+#     to recover.
+#   per-patch background flux p1 0.0108 / median 0.0142 / p99 0.0213, a 2.0x
+#     spread against m32's 250x. There is very little for --sky-aug to bite on.
+seed: 0
+data:
+  observed_fits: data/m31bK50_trim.fits
+  ideal_fits: data/m31bK50.fits
+  out_dir: data/m31bK50_s16
+  patch_size: 64
+  stride: 16
+  observed_normalize: asinh
+  ideal_normalize: asinh
+  asinh_softening: 1.0
+  observed_asinh_beta: null
+  ideal_asinh_beta: null
+  split_block_size: 512
+  val_fraction: 0.1
+  fit_photometry: true
+  crop: null
