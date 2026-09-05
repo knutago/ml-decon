@@ -1,0 +1,58 @@
+# M32 v2 simulation, F555W — regenerated at patch 128 / stride 24.
+#
+# WHY REGENERATE. The existing data/m32_sim_f555w is 3473 train patches of
+# 64x64 = 16.3 Mpix. That is a QUARTER of what m31bK50 gave (14153 patches),
+# and it is the dataset a 4.2M-parameter prior would have to learn from. This
+# config gives 6561 patches of 128x128 = 107 Mpix, a 6.6x increase in pixels.
+#
+#   patch/stride   patches   Mpix
+#     64 / 32       3969      16.3   <- current
+#     64 / 16      15625      64.0
+#    128 / 32       3721      61.0
+#    128 / 24       6561     107.5   <- this config
+#
+# WHY 128 AND NOT JUST A SMALLER STRIDE. Two reasons, and only the second is
+# about the model:
+#   1. Edge exclusion. The scorer drops a 4-px border, which is 23% of a 64-px
+#      patch's pixels but 12% of a 128-px one. Smaller stride does not fix
+#      that; larger patches do.
+#   2. Receptive field. The wide prior's RF is 85 px. On a 64-px patch that
+#      saturates -- every output pixel already sees every input pixel, so the
+#      extra reach is wasted. On 128 px it is a genuine neighbourhood. Note
+#      the flat CNN is fully convolutional and VERIFIED size-agnostic (64,
+#      128, 256 all round-trip), but ONLY with --norm none; GroupNorm makes
+#      behaviour input-size dependent, so a 128-trained GroupNorm model would
+#      not be usable at other sizes.
+#
+# CAVEAT: overlapping patches are not independent samples. Stride 24 on a
+# 128-px patch is 81% overlap. What it buys is sub-patch phase and boundary
+# context, not new sky -- the frame is still one 2048^2 image.
+#
+# UNCHANGED FROM config/m32_sim_f555w.yaml, and still true:
+#   - fit_photometry false: the pair is NOT photometrically matched, the
+#     network absorbs the gain (~0.97), and flux ratios against the ideal
+#     carry it. Nearly a no-op on the encoded patches either way, because
+#     fit_normalization derives median and beta from the data.
+#   - crop null: the frames are 100% populated over the full 2048^2.
+#   - THE TRUTH IS A CATALOGUE RENDERING, 94.4% exact zeros, with no diffuse
+#     component, while the conv carries a ~300-count sky. The model must infer
+#     and cancel a background that has no representation in its output space.
+#     No patch geometry fixes that; regenerating the truth with a diffuse
+#     component would. See the sibling memory on the m31 ideal's noise floor.
+#   - fit_asinh_beta's sparse-field path WILL warn. That is the fix working.
+seed: 0
+data:
+  observed_fits: data/m32_sim/sim_f555w_conv.fits
+  ideal_fits: data/m32_sim/sim_f555w_truth.fits
+  out_dir: data/m32_sim_f555w_p128
+  patch_size: 128
+  stride: 24
+  observed_normalize: asinh
+  ideal_normalize: asinh
+  asinh_softening: 1.0
+  observed_asinh_beta: null
+  ideal_asinh_beta: null
+  split_block_size: 512
+  val_fraction: 0.1
+  fit_photometry: false
+  crop: null
