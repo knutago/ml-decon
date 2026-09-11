@@ -1,0 +1,45 @@
+# M32 v2 simulation, F435W — patch 128 / stride 24.
+#
+# The F435W twin of config/m32_sim_f555w_p128.yaml, created 2026-09-11 so a
+# wide (85-px receptive field) normless prior can be trained on THIS band.
+# Only the two input FITS and out_dir differ from the F555W config; the patch
+# geometry is deliberately identical so the two arms are comparable.
+#
+# WHY 128 AND NOT THE EXISTING data/m32_sim_f435w (64 px):
+#   1. Receptive field. The wide prior's RF is 85 px, which SATURATES on a
+#      64-px patch — every output pixel already sees every input pixel, so the
+#      extra reach is wasted and the 4.2M parameters have nothing to learn
+#      with. This is the whole reason the F555W wide arm was regenerated.
+#   2. Edge exclusion. The scorer drops a 4-px border: 23% of a 64-px patch's
+#      pixels, 12% of a 128-px one.
+#   3. Volume. 64/32 gives ~3969 patches = 16.3 Mpix; 128/24 gives ~6561
+#      patches = 107 Mpix.
+#
+# Size-agnosticism is ONLY true with --norm none. A GroupNorm model trained at
+# 128 would not be usable at other sizes, so this dataset and `--norm none`
+# go together.
+#
+# CAVEAT, unchanged from the F555W config: stride 24 on a 128-px patch is 81%
+# overlap. That buys sub-patch phase and boundary context, not new sky — the
+# frame is still one 2048^2 image, so the patches are not independent samples.
+#
+# Also unchanged and still true: the truth is a CATALOGUE RENDERING with no
+# diffuse component while the conv carries a sky pedestal, so the model must
+# infer and cancel a background that has no representation in its output
+# space. fit_asinh_beta's sparse-field path WILL warn; that is the fix working.
+seed: 0
+data:
+  observed_fits: data/m32_sim/sim_f435w_conv.fits
+  ideal_fits: data/m32_sim/sim_f435w_truth.fits
+  out_dir: data/m32_sim_f435w_p128
+  patch_size: 128
+  stride: 24
+  observed_normalize: asinh
+  ideal_normalize: asinh
+  asinh_softening: 1.0
+  observed_asinh_beta: null
+  ideal_asinh_beta: null
+  split_block_size: 512
+  val_fraction: 0.1
+  fit_photometry: false
+  crop: null
