@@ -30,7 +30,8 @@ NOTE the transform convention differs from flat_cnn_diffusion:
 import numpy as np
 import torch
 
-from train_conditional_diffusion import ConditionalFlatCNN, cosine_alpha_bar
+from train_conditional_diffusion import (ConditionalFlatCNN, cosine_alpha_bar,
+                                         model_from_checkpoint)
 
 
 class ConditionalDenoiser:
@@ -39,13 +40,11 @@ class ConditionalDenoiser:
             "cuda" if torch.cuda.is_available() else "cpu")
         ck = torch.load(ckpt_path, map_location=self.device, weights_only=False)
 
-        arch = ck["arch"]
-        # "norm" is absent from every pre---norm-flag checkpoint, and those are
-        # all GroupNorm, so the default preserves existing behaviour exactly.
-        self.model = ConditionalFlatCNN(
-            channels=arch["channels"], t_dim=arch.get("t_dim", 128),
-            norm=arch.get("norm", "group")
-        ).to(self.device)
+        # Rebuild whatever arch the checkpoint was trained with. "kind" and
+        # "norm" are both absent from pre-flag checkpoints, and those are all
+        # flat/GroupNorm, so the defaults inside model_from_checkpoint
+        # reproduce the old behaviour exactly.
+        self.model = model_from_checkpoint(ck).to(self.device)
         state = None
         if prefer_ema:
             state = ck.get("ema_state")

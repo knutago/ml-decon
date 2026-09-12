@@ -81,9 +81,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from red_pnp_deconvolve import (TorchNorm, load_checkpoint, load_kernel,
-                                gaussian_kernel, make_otf, parse_indices, show,
-                                row_norm, tweedie_chain)
+# The denoiser comes from model_denoise, not from another solver script.
+from model_denoise import load_checkpoint, tweedie_chain
+# Normalization, PSF/OTF and plotting stay where they are: they are shared
+# utilities, not denoiser code, and ~40 other modules import them from here.
+from red_pnp_deconvolve import (TorchNorm, load_kernel, gaussian_kernel,
+                                make_otf, parse_indices, show, row_norm)
 from cond_sample_npy import find_peaks, concentration
 from train_conditional_diffusion import cosine_alpha_bar
 
@@ -519,6 +522,33 @@ def main():
                         "8-patch flat-patch TOTAL flux of 1.003 that first "
                         "motivated this default -- total flux includes the "
                         "removed floor and hid the per-source deficit.")
+    p.add_argument("--min-dchi2", type=float, default=0.0, metavar="K",
+                   help="SIGNIFICANCE PROX in the z-update: zero any peak whose "
+                        "3x3 flux falls below sqrt(K)*sigma_b/(gain*|psf|), the "
+                        "flux at which a point source reaches sqrt(K) sigma in "
+                        "the OBSERVED frame. 0 disables.\n"
+                        "This is --sparse-tau's job done against the right "
+                        "reference. --sparse-tau thresholds on the ITERATE's "
+                        "own background sigma, which collapses as the solve "
+                        "sparsifies, so the cut chases the thing it is trying "
+                        "to remove; with tau=2.0 already on, 71.9%% of "
+                        "detections are still spurious. sigma_b is fixed for "
+                        "the whole run.\n"
+                        "Measured post-hoc on m32_sim_f555w/64 at K=4: removes "
+                        "92%% of spurious sources, purity 28.1%% -> 71.0%%, LF "
+                        "total ratio 3.11 -> 1.10, and the crowding_lf.py "
+                        "self-consistency 1.89x -> 1.07x. The real sources it "
+                        "drops have median recon/truth flux 0.091 (they are "
+                        "the blend cloud, whose photometry is junk); those it "
+                        "keeps sit at 1.021 with ZERO cloud members. K=4 is "
+                        "2 sigma; the flux limit it implies (mag -8.43 here) "
+                        "is a property of the data, so quote it with the "
+                        "catalogue and apply it to the TRUTH too when scoring.")
+    p.add_argument("--min-dchi2-start", type=float, default=0.75, metavar="F",
+                   help="fraction of --iters before --min-dchi2 switches on. "
+                        "Pruning support early locks in a support that cannot "
+                        "revive: early-start reweighted L1 plateaus at 63.6%% "
+                        "where a late start reaches 80.2%%. Default 0.75.")
     p.add_argument("--sparse-mode", choices=["hard", "soft"], default="hard",
                    help="'soft' is the true L1 prox, x -> sign(x)*max(|x|-tau, 0), "
                         "and shrinks EVERY source including the bright ones -- "
@@ -992,6 +1022,22 @@ def main():
         print("[cond] --drop-conditioning: feeding the NULL token; this "
               "checkpoint is being used as an UNCONDITIONAL prior")
 
+    # Per-patch flux at which a point source reaches sqrt(K) sigma in the
+    # OBSERVED frame: b contributes gain * f * psf, so SNR = gain*f*|psf|/sigma_b.
+    # Computed once -- it is a property of the data, not of the iterate.
+    mf_cut = torch.zeros(B, dtype=x.dtype, device=device)
+    if args.min_dchi2 > 0:
+        from astropy.stats import sigma_clipped_stats
+        npsf = float(np.sqrt(np.sum((kernel / kernel.sum()) ** 2)))
+        sig_b = np.array([sigma_clipped_stats(b.cpu().numpy()[i, 0], sigma=3.0,
+                                              maxiters=5)[2] for i in range(B)])
+        mf_cut = torch.tensor(np.sqrt(args.min_dchi2) * sig_b / (gain * npsf),
+                              dtype=x.dtype, device=device)
+        print(f"[sig]  --min-dchi2 {args.min_dchi2:g} from iter "
+              f"{int(args.min_dchi2_start * args.iters)}: 3x3 flux cut "
+              f"{mf_cut.min().item():.1f}..{mf_cut.max().item():.1f} "
+              f"(SNR {np.sqrt(args.min_dchi2):.2f} in the observed frame)")
+
     hist = {"data": [], "prim": [], "dual": [], "conc": []}
     z_acc, n_acc = None, 0
     chain_trace = []
@@ -1062,6 +1108,23 @@ def main():
                 z = torch.sign(z) * torch.clamp(z.abs() - tau.abs(), min=0.0)
             else:
                 z = torch.where(z > tau, z, torch.zeros_like(z))
+
+        # ---- significance prox: drop what the MEASUREMENT cannot support ----
+        # --sparse-tau keys off the iterate's OWN background sigma, which
+        # collapses as the solve sparsifies, so its threshold chases the thing
+        # it is trying to cut and lets a faint-spike forest through (measured:
+        # 71.9% spurious with tau=2.0 already on). This keys off the OBSERVED
+        # frame instead, which is fixed for the whole run: keep a peak only if
+        # deleting it would change the fit by dchi2 = f^2*sum(psf^2)/sigma_b^2
+        # >= K, i.e. its matched-filter SNR^2 in the data.
+        #
+        # Applied LATE by default. Support-pruning early locks in a support
+        # that cannot revive -- the same failure that makes early-start
+        # reweighted L1 plateau at 63.6% against a late start's 80.2%.
+        if args.min_dchi2 > 0 and k >= args.min_dchi2_start * args.iters:
+            f = torch.nn.functional.avg_pool2d(z, 3, 1, 1) * 9.0   # 3x3 box flux
+            keep = f >= mf_cut.view(-1, 1, 1, 1)
+            z = torch.where(keep, z, torch.zeros_like(z))
 
         # Polyak averaging of the OUTPUT only -- the recursion below still uses
         # the instantaneous z, so the dynamics are unchanged.
@@ -1295,9 +1358,10 @@ def main():
             col += 1
         if have_truth:
             show(ax[i2, col], truth_np[i2], "ideal (truth)", nrm)
-    fig.suptitle("one asinh stretch per row, set by the row's background "
-                 "scale -- observed keeps its own (it is blurred)",
-                 fontsize=9, y=1.0)
+    fig.suptitle("one asinh stretch per row (row_norm: background scale, or "
+                 "the faint-source scale when a panel has no background -- "
+                 "the m32 truth has none)\nobserved keeps its own stretch (it "
+                 "is blurred)", fontsize=9, y=1.0)
     fig.tight_layout(); fig.savefig(args.out_dir / "patches.png", dpi=130)
     plt.close(fig)
 
