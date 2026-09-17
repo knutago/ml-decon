@@ -171,7 +171,8 @@ class AsinhNorm(Normalization):
         self.hi_s = hi_s
 
     @classmethod
-    def fit(cls, pixels, asinh_softening=3.0, asinh_beta=None, **_):
+    def fit(cls, pixels, asinh_softening=3.0, asinh_beta=None,
+            asinh_lo_s=None, asinh_hi_s=None, **_):
         # beta is a few times the sigma-clipped noise std; clipping ignores the sources so
         # beta tracks the background noise. See fit_asinh_beta for what happens when there
         # is no background to track -- that path used to invent beta = 1.0 in silence.
@@ -182,12 +183,40 @@ class AsinhNorm(Normalization):
         if not hi > lo:
             raise ValueError(f"asinh fit needs a non-degenerate range, got min == max == {lo!r}")
         beta = fit_asinh_beta(pixels, median, std, asinh_softening, asinh_beta)
-        return cls(
-            median=median,
-            beta=beta,
-            lo_s=float(np.arcsinh((lo - median) / beta)),
-            hi_s=float(np.arcsinh((hi - median) / beta)),
-        )
+        # asinh_lo_s / asinh_hi_s pin the SPAN, so two datasets can share one
+        # flux -> z map. See DataConfig.observed_asinh_lo_s for why a two-band
+        # prior needs that. Warn rather than clip when the pin does not cover the
+        # data: z outside [0, 1] is not itself fatal (the transform stays exact,
+        # which is this module's contract), but the training data is MEANT to be
+        # [0, 1] and the sampler's x0 clamp is set there, so quietly handing it
+        # out-of-range pixels would move that clamp's meaning with nothing in the
+        # log to say so.
+        fit_lo = float(np.arcsinh((lo - median) / beta))
+        fit_hi = float(np.arcsinh((hi - median) / beta))
+        lo_s = fit_lo if asinh_lo_s is None else float(asinh_lo_s)
+        hi_s = fit_hi if asinh_hi_s is None else float(asinh_hi_s)
+        if not hi_s > lo_s:
+            raise ValueError(f"asinh span must be increasing, got lo_s={lo_s!r} hi_s={hi_s!r}")
+        # Tolerance, not equality. A pinned span carried through a config file is
+        # rounded (6 decimals is typical), so it lands a few ULP below the field's
+        # own max and a bare `>` fires on every correct run -- which is worse than
+        # no warning, because a guard that cries wolf is one people learn to skip.
+        # Judge by how far out of [0, 1] the worst pixel actually lands: below
+        # ~1e-3 nothing downstream can tell (the sampler's x0 clamp included).
+        span = hi_s - lo_s
+        worst = max((lo_s - fit_lo) / span, (fit_hi - hi_s) / span, 0.0)
+        if worst > 1e-3:
+            out = float(np.mean((pixels < median + beta * np.sinh(lo_s))
+                                | (pixels > median + beta * np.sinh(hi_s))))
+            warnings.warn(
+                f"asinh: the pinned span [{lo_s:.6g}, {hi_s:.6g}] does not cover this field, "
+                f"whose own extremes are [{fit_lo:.6g}, {fit_hi:.6g}] -- {out:.4%} of pixels "
+                f"encode outside [0, 1], the worst by {worst:.4g} in z. Pin hi_s from the "
+                f"BRIGHTEST band of the set you are sharing the map across, and compute the "
+                f"max over the FULL split: a subsample's max is not the field's max (a "
+                f"256-patch sample understated these frames' by 3.7-5.3x).",
+                RuntimeWarning, stacklevel=3)
+        return cls(median=median, beta=beta, lo_s=lo_s, hi_s=hi_s)
 
     # s(x) = arcsinh((x - median) / beta) ; f(x) = (s(x) - lo_s) / (hi_s - lo_s)
     def forward(self, x):

@@ -208,14 +208,26 @@ class NpyPairDataset(Dataset):
     """
 
     def __init__(self, observed: np.ndarray, ideal: np.ndarray,
-                 augment: bool = False, sky_aug: "SkyAug | None" = None):
+                 src: np.ndarray | None = None,
+                 augment: bool = False, sky_aug=None):
         if observed.shape != ideal.shape:
             sys.exit(f"[data] observed {observed.shape} and ideal "
                      f"{ideal.shape} arrays must have identical shapes")
         self.observed = np.ascontiguousarray(observed, dtype=np.float32)
         self.ideal = np.ascontiguousarray(ideal, dtype=np.float32)
         self.augment = augment
-        self.sky_aug = sky_aug
+        # `src[i]` is which --data-dir sample i came from, and sky_aug is one
+        # SkyAug PER dir. They cannot be shared: SkyAug places a FLUX offset,
+        # so it needs the z<->flux map of the dataset the patch was encoded
+        # with. Under the shared two-band map those maps agree in every
+        # constant except the observed median -- which is the sky, 207 vs 386
+        # counts, i.e. 2.6 beta apart and well past the asinh knee. Using one
+        # band's map on the other's patches would misplace every offset.
+        self.src = (np.zeros(len(self.observed), np.int64) if src is None
+                    else np.ascontiguousarray(src, dtype=np.int64))
+        self.sky_aug = ([] if sky_aug is None else
+                        [sky_aug] if not isinstance(sky_aug, (list, tuple))
+                        else list(sky_aug))
 
     def __len__(self):
         return len(self.observed)
@@ -232,23 +244,113 @@ class NpyPairDataset(Dataset):
             if k >= 4:
                 observed = np.flip(observed, axis=-1)
                 ideal = np.flip(ideal, axis=-1)
-        if self.sky_aug is not None:
+        if self.sky_aug:
             # Observed only. A constant commutes with D4, so the order here
             # is presentation, not correctness.
-            observed = self.sky_aug.apply(observed)
+            observed = self.sky_aug[self.src[idx]].apply(observed)
         return (
             torch.from_numpy(np.ascontiguousarray(ideal)),
             torch.from_numpy(np.ascontiguousarray(observed)),
         )
 
 
-def load_split(data_dir: Path, split: str):
-    observed = np.load(data_dir / f"{split}_observed.npy")
-    ideal = np.load(data_dir / f"{split}_ideal.npy")
-    print(f"[data] {split}: {len(observed)} pairs {tuple(observed.shape[1:])} "
-          f"observed[{observed.min():+.4f}, {observed.max():+.4f}] "
-          f"ideal[{ideal.min():+.4f}, {ideal.max():+.4f}]")
-    return observed, ideal
+def load_split(data_dirs, split: str):
+    """Concatenate one or more generated datasets, tracking which is which.
+
+    Returns (observed, ideal, src), src[i] = index into data_dirs.
+
+    Several dirs is how a TWO-BAND prior is trained: one model over F435W and
+    F555W patches together. That is not a convenience -- it is what makes the
+    colour measurable. Whatever bias the prior has (flux deficit, splitting
+    sources) is then COMMON-MODE across the bands and subtracts out of B-V;
+    two separate priors have two different biases and the difference lands
+    straight on the colour axis. Measured: one shared prior took the CMD
+    colour slope 0.156 -> 0.027 and the scatter 0.520 -> 0.347.
+
+    The dirs must have been generated with a SHARED asinh map (see the
+    *_p128_common configs), or the same flux means a different z in each and
+    concatenating them trains the model on a contradiction. Checked in
+    load_dataset_norms, not here.
+    """
+    if isinstance(data_dirs, (str, Path)):
+        data_dirs = [data_dirs]
+    obs, ide, src = [], [], []
+    for i, d in enumerate(data_dirs):
+        o = np.load(Path(d) / f"{split}_observed.npy")
+        v = np.load(Path(d) / f"{split}_ideal.npy")
+        obs.append(o)
+        ide.append(v)
+        src.append(np.full(len(o), i, np.int64))
+        print(f"[data] {split}[{i}] {Path(d).name}: {len(o)} pairs "
+              f"{tuple(o.shape[1:])} "
+              f"observed[{o.min():+.4f}, {o.max():+.4f}] "
+              f"ideal[{v.min():+.4f}, {v.max():+.4f}]")
+    observed = np.concatenate(obs, 0) if len(obs) > 1 else obs[0]
+    ideal = np.concatenate(ide, 0) if len(ide) > 1 else ide[0]
+    src = np.concatenate(src, 0)
+    if len(obs) > 1:
+        counts = " + ".join(str(len(o)) for o in obs)
+        print(f"[data] {split}: {counts} = {len(observed)} pairs over "
+              f"{len(obs)} datasets")
+    return observed, ideal, src
+
+
+# The fields a shared map must agree on. `median` is EXCLUDED on purpose: it is
+# the sky, it genuinely differs between bands (207 vs 386 counts on the m32
+# sims), and leaving it per-band is what makes z a function of amplitude ABOVE
+# sky -- so a source of given brightness maps to the same z in either filter.
+# Everything else agreeing is the whole content of the shared-map change.
+_NORM_SHARED_FIELDS = ("method", "beta", "lo_s", "hi_s", "lo", "hi")
+
+
+def load_dataset_norms(data_dirs):
+    """Read each dir's norm.json and REFUSE a mismatched set.
+
+    Training one prior across datasets whose flux->z maps disagree is silently
+    wrong: identical z would mean different flux depending on which dir the
+    patch came from, so the model learns an average of two contradictory
+    transforms. That failure is invisible in the loss and only surfaces much
+    later as bad photometry, which is exactly the class of bug this project
+    keeps paying for. Fail at startup instead.
+    """
+    norms = []
+    for d in data_dirs:
+        p = Path(d) / "norm.json"
+        if not p.exists():
+            print(f"[data] WARNING: no norm.json in {d}; checkpoints will not "
+                  f"carry the normalized->physical map and downstream "
+                  f"photometry cannot be inverted to flux.")
+            return None
+        norms.append(json.loads(p.read_text()))
+        print(f"[data] dataset norm ({p}): {norms[-1]}")
+    ref = norms[0]
+    for d, n in zip(data_dirs[1:], norms[1:]):
+        for ch in ("observed", "ideal"):
+            for k in _NORM_SHARED_FIELDS:
+                if k in ref[ch] or k in n[ch]:
+                    a, b = ref[ch].get(k), n[ch].get(k)
+                    if a != b:
+                        sys.exit(
+                            f"[data] {Path(d).name}'s {ch} norm disagrees with "
+                            f"{Path(data_dirs[0]).name}'s on {k!r}: {b!r} vs "
+                            f"{a!r}.\n"
+                            f"       Training one prior over datasets with "
+                            f"different flux->z maps is silently wrong -- the "
+                            f"same z would mean different flux per dir.\n"
+                            f"       Regenerate both with a SHARED asinh map "
+                            f"(pin asinh_beta/lo_s/hi_s; see the "
+                            f"config/*_p128_common.yaml pair).")
+        if ref["ideal"].get("median") != n["ideal"].get("median"):
+            sys.exit(f"[data] ideal medians differ ({ref['ideal'].get('median')} "
+                     f"vs {n['ideal'].get('median')}); the target map must be "
+                     f"identical across bands or the decoded flux is band-"
+                     f"dependent.")
+    if len(norms) > 1:
+        meds = ", ".join(f"{Path(d).name} {n['observed'].get('median'):.2f}"
+                         for d, n in zip(data_dirs, norms))
+        print(f"[data] shared map confirmed across {len(norms)} datasets; "
+              f"observed medians (per-band sky, expected to differ): {meds}")
+    return norms
 
 
 # ----------------------------------------------------------------------------
@@ -721,8 +823,21 @@ def save_checkpoint(path, model, ema, ema_is_lib, optimizer, epoch,
         # dataset's stored domain; `dataset_norm` is the generator's
         # norm.json, which is the ONLY map between that domain and physical
         # flux. Inverting it is the consumer's job.
+        # SINGULAR keys kept for every existing consumer. With one --data-dir
+        # they are exactly what they always were. With several they are the
+        # FIRST dir's, which is safe for the half that matters most -- the
+        # ideal norm is required to be identical across dirs, and that is the
+        # map used to decode the model's OUTPUT back to flux.
         "dataset_norm": dataset_norm,
-        "data_dir": str(args.data_dir),
+        "data_dir": str(args.data_dir[0]),
+        # PLURAL keys are the truth for a multi-band checkpoint. The entries
+        # differ only in observed.median (the per-band sky), and a consumer
+        # encoding a measurement into the network's domain must pick the one
+        # matching its own data -- admm_diffusion_deconvolve does that by
+        # matching the data dir's norm.json. Absent = single-dataset
+        # checkpoint, which is the pre-2026-09-16 format.
+        "dataset_norms": dataset_norms,
+        "data_dirs": [str(d) for d in args.data_dir],
         # "norm" MUST stay in here: a normless checkpoint loaded into a
         # GroupNorm model has no blocks.*.norm.* keys, and any consumer that
         # loads with strict=False would silently run a partly-random network.
@@ -767,10 +882,14 @@ def main():
     ap = argparse.ArgumentParser(
         description="Train a conditional flat-CNN DDPM on observed/ideal "
                     ".npy patch pairs (ml-decon gen_data output).")
-    ap.add_argument("--data-dir", type=Path,
-                    default=Path("/home/alex/noir_ml/global/ml-decon/data/m31bK50"),
+    ap.add_argument("--data-dir", type=Path, action="append", default=None,
                     help="directory holding {train,val}_{observed,ideal}.npy "
-                         "and norm.json")
+                         "and norm.json. REPEATABLE: pass it twice to train "
+                         "ONE prior over both bands, which is what makes the "
+                         "prior's bias common-mode so it cancels out of B-V. "
+                         "All dirs must share one asinh map (everything but "
+                         "the observed median, which is the sky) -- enforced "
+                         "at startup by load_dataset_norms.")
     # New default dir: the old checkpoints_cond_diffusion/*.pt use the
     # retired 'transform' (flux_ratio, asinh_b, asinh_A) format and would be
     # clobbered by the new-format files.
@@ -898,6 +1017,10 @@ def main():
     ap.add_argument("--device", type=str,
                     default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
+    # action="append" cannot carry a default without appending to it, so the
+    # default is applied here. One dir behaves exactly as before this change.
+    if not args.data_dir:
+        args.data_dir = [Path("/home/alex/noir_ml/global/ml-decon/data/m31bK50")]
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -912,26 +1035,24 @@ def main():
     # Arrays are used exactly as stored: the generator owns the domain.
     # norm.json is read BEFORE the datasets are built: --sky-aug needs the
     # frozen flux<->z map to place its offset in flux space.
-    norm_path = args.data_dir / "norm.json"
-    if norm_path.exists():
-        dataset_norm = json.loads(norm_path.read_text())
-        print(f"[data] dataset norm ({norm_path}): {dataset_norm}")
-    else:
-        dataset_norm = None
-        print(f"[data] WARNING: no norm.json in {args.data_dir}; checkpoints "
-              f"will not carry the normalized->physical map and downstream "
-              f"photometry cannot be inverted to flux.")
+    dataset_norms = load_dataset_norms(args.data_dir)
+    dataset_norm = dataset_norms[0] if dataset_norms else None
 
     sky_aug = None
     if args.sky_aug:
-        if dataset_norm is None:
-            sys.exit(f"[sky-aug] --sky-aug requires norm.json in "
-                     f"{args.data_dir}: the offset is a FLUX offset and there "
-                     f"is no way to map it into the stored domain without the "
+        if dataset_norms is None:
+            sys.exit(f"[sky-aug] --sky-aug requires norm.json in every "
+                     f"--data-dir: the offset is a FLUX offset and there is no "
+                     f"way to map it into the stored domain without the "
                      f"generator's transform.")
-        sky_aug = SkyAug(dataset_norm["observed"],
-                         args.sky_aug_lo, args.sky_aug_hi)
-        print(sky_aug.report())
+        # One per dataset -- see NpyPairDataset.__init__ for why they cannot be
+        # shared across bands even under a shared map.
+        sky_aug = [SkyAug(n["observed"], args.sky_aug_lo, args.sky_aug_hi)
+                   for n in dataset_norms]
+        print(sky_aug[0].report())
+        if len(sky_aug) > 1:
+            print(f"[sky-aug] {len(sky_aug)} maps, one per --data-dir "
+                  f"(report above is for {Path(args.data_dir[0]).name})")
 
     train_ds = NpyPairDataset(*load_split(args.data_dir, "train"),
                               augment=not args.no_augment, sky_aug=sky_aug)

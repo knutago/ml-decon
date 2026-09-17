@@ -146,10 +146,14 @@ def main(config_path):
     train_mask = splits == "train"
     observed_norm = fit_normalization(observed_raw[train_mask], data.observed_normalize,
                                       asinh_softening=data.asinh_softening,
-                                      asinh_beta=data.observed_asinh_beta)
+                                      asinh_beta=data.observed_asinh_beta,
+                                      asinh_lo_s=data.observed_asinh_lo_s,
+                                      asinh_hi_s=data.observed_asinh_hi_s)
     ideal_norm = fit_normalization(ideal_raw[train_mask], data.ideal_normalize,
                                    asinh_softening=data.asinh_softening,
-                                   asinh_beta=data.ideal_asinh_beta)
+                                   asinh_beta=data.ideal_asinh_beta,
+                                   asinh_lo_s=data.ideal_asinh_lo_s,
+                                   asinh_hi_s=data.ideal_asinh_hi_s)
 
     # Report the fitted transforms. A bad normalization is invisible in the patches
     # themselves and only surfaces much later as a bad reconstruction, so put the numbers

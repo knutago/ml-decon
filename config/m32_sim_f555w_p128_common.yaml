@@ -1,0 +1,45 @@
+# M32 v2 simulation, F555W -- SHARED two-band asinh map.
+#
+# The sibling of m32_sim_f435w_p128_common.yaml. The six asinh constants below
+# are IDENTICAL in both files by design -- that is the entire point, and the
+# thing to check first if a two-band result looks wrong. Everything else is
+# unchanged from m32_sim_f555w_p128.yaml.
+#
+# See the F435W config for the full rationale and for how the values were
+# chosen (common_norm_fit.py). In brief: beta is normally fit per band and
+# tracks that band's own star brightness (247.3 here vs 945.5 there), so the
+# per-band map divides the colour out -- a measured 3.86x flux ratio reaches
+# the network as 0.87x in z. One map means a given flux means a given z in both
+# bands, so colour survives into what the prior actually sees.
+#
+# The median stays per band: it is the sky (386 counts here, 207 there), and
+# leaving it free is what makes z a function of amplitude ABOVE sky, so the same
+# source maps identically in both bands.
+#
+# hi_s is pinned from THIS band, the brighter of the two -- 8.007743 =
+# arcsinh(max/300) over both -- so F555W's peak still lands at z <= 1 and never
+# enters the region where the sinh inverse explodes.
+#
+# Train ONE prior on the union of this dataset and the F435W one. An existing
+# single-band checkpoint applied to data under this map reproduces the old
+# cross-band bug with the sign flipped.
+seed: 0
+data:
+  observed_fits: data/m32_sim/sim_f555w_conv.fits
+  ideal_fits: data/m32_sim/sim_f555w_truth.fits
+  out_dir: data/m32_sim_f555w_p128_common
+  patch_size: 128
+  stride: 24
+  observed_normalize: asinh
+  ideal_normalize: asinh
+  asinh_softening: 1.0
+  observed_asinh_beta: 68.287974
+  observed_asinh_lo_s: -2.615495
+  observed_asinh_hi_s: 7.654147
+  ideal_asinh_beta: 150.000000
+  ideal_asinh_lo_s: 0.000000
+  ideal_asinh_hi_s: 10.376988
+  split_block_size: 512
+  val_fraction: 0.1
+  fit_photometry: false
+  crop: null

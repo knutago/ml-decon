@@ -34,6 +34,27 @@ class DataConfig:
     # as None to fit from the background, which is right whenever there is a background.
     observed_asinh_beta: float | None = None
     ideal_asinh_beta: float | None = None
+    # Pin the asinh SPAN as well as the knee. lo_s/hi_s are normally
+    # arcsinh((min - median)/beta) and arcsinh((max - median)/beta), i.e. this
+    # frame's own extremes, so two frames of the same field in different filters
+    # get different maps even with beta pinned.
+    #
+    # That is not cosmetic. beta is fit per band and tracks how bright that
+    # band's stars are (247 in F435W, 945 in F555W), so the per-band map DIVIDES
+    # OUT THE COLOUR: a measured 3.86x flux ratio between the bands reaches the
+    # two networks as 0.87x in z. Colour is the only thing a CMD measures, so a
+    # two-band prior needs ONE map -- same median convention, same beta, same
+    # span -- for a given flux to mean a given z in both. Pin all of it here and
+    # a cross-band application becomes an identity instead of a 0.65x rescale.
+    #
+    # Pin hi_s to cover the BRIGHTER band's maximum: anything above it encodes
+    # to z > 1, where the sinh inverse is explosive (z = 1.2 is a 14x flux
+    # error). Leave as None to fit from the data, which is right for any
+    # single-band dataset.
+    observed_asinh_lo_s: float | None = None
+    observed_asinh_hi_s: float | None = None
+    ideal_asinh_lo_s: float | None = None
+    ideal_asinh_hi_s: float | None = None
     split_block_size: int = 505  # side length (px) of blocks assigned wholesale to train or val
     val_fraction: float = 0.2
     # Whether to put the observed image into the IDEAL's photometric units --

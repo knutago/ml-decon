@@ -693,6 +693,35 @@ def main():
     ck_norms = ck["dataset_norm"]
     dir_path = args.data_dir / "norm.json"
     dir_norms = json.loads(dir_path.read_text()) if dir_path.exists() else None
+
+    # MULTI-BAND CHECKPOINT. A prior trained over several --data-dirs carries
+    # one norm per dir in "dataset_norms". They agree in every constant except
+    # observed.median, which is that band's sky (207 counts in F435W, 386 in
+    # F555W) -- so the IDEAL map, the one that decodes the model's output back
+    # to flux, is unambiguous, but encoding a measurement into the network's
+    # domain needs THIS band's median. Pick it by matching the data dir's own
+    # norm.json; that is how the caller already says which band it is holding,
+    # so nothing downstream (run_cmd_fullframe.sh included) needs a new flag.
+    ck_list = ck.get("dataset_norms")
+    if ck_list and len(ck_list) > 1:
+        want = (dir_norms or {}).get("observed", {}).get("median")
+        hit = next((n for n in ck_list
+                    if want is not None
+                    and np.isclose(float(n["observed"]["median"]), float(want),
+                                   rtol=1e-4)), None)
+        names = ", ".join(f"{float(n['observed']['median']):.2f}" for n in ck_list)
+        if hit is not None:
+            ck_norms = hit
+            print(f"[norm] multi-band checkpoint ({len(ck_list)} datasets, "
+                  f"observed medians {names}); matched this data dir's "
+                  f"{float(want):.2f}")
+        else:
+            print(f"[norm] *** multi-band checkpoint ({len(ck_list)} datasets, "
+                  f"observed medians {names}) but NONE matches this data dir's "
+                  f"{want!r} *** falling back to the first. The conditioning "
+                  f"will be encoded against the wrong sky -- regenerate this "
+                  f"dataset with the shared map, or pass --norm-from-data-dir "
+                  f"if you know the dir's map is the right one.")
     if ck_norms and dir_norms:
         for ch in ("observed", "ideal"):
             a, b_ = ck_norms.get(ch, {}), dir_norms.get(ch, {})
