@@ -29,7 +29,24 @@
 set -euo pipefail
 ML=${ML_DECON:-$WORK/ml-decon}
 PY=${PY:-$ML/.venv/bin/python}
-OUT=${OUT:-$ML/m32sim_arms/ckpt_m32sim_twoband_common}
+# Checkpoints go to $SCRATCH when it exists -- the convention train_f435w_wide.sh
+# documents for Vista ("--checkpoint-dir $SCRATCH/m32sim_arms/..."). Scratch is
+# the fast filesystem and these are 67 MB a side written every time val improves;
+# $WORK has a quota and is not meant for that traffic. Scratch IS PURGED, so copy
+# best.pt to $WORK/ml-decon/m32sim_arms/ when the run finishes.
+if [ -n "${OUT:-}" ]; then :
+elif [ -n "${SCRATCH:-}" ]; then OUT=$SCRATCH/m32sim_arms/ckpt_m32sim_twoband_common
+else OUT=$ML/m32sim_arms/ckpt_m32sim_twoband_common; fi
+
+# EPOCHS 300, not the 600 the single-band arms used, and this is deliberate.
+# Two bands is 11450 train pairs against 5725, so an epoch is twice the work:
+# 5725 x 600 = 11450 x 300 = 3.4M samples, i.e. THE SAME GRADIENT-STEP BUDGET as
+# the F555W run, reached in half the wall time. At the measured 61.5 s/epoch for
+# 5725 pairs, 600 two-band epochs would be ~21 h -- and the trainer has NO
+# --resume, so a walltime kill loses everything. 300 lands near 10.5 h, which
+# fits a 24 h job with real margin. Raise it only with a longer -t.
+EPOCHS=${EPOCHS:-300}
+WORKERS=${WORKERS:-8}
 
 DB=$ML/data/m32_sim_f435w_p128_common
 DV=$ML/data/m32_sim_f555w_p128_common
@@ -55,7 +72,8 @@ TRAIN_CMD=("$PY" "$ML/core/train_conditional_diffusion.py"
   --data-dir       "$DB"          # repeatable: this is what makes it two-band
   --data-dir       "$DV"
   --checkpoint-dir "$OUT"
-  --epochs 600
+  --epochs "$EPOCHS"
+  --num-workers "$WORKERS"
   --batch-size 32
   --lr 2e-4
   --timesteps 1000
@@ -76,9 +94,39 @@ case "${1:-show}" in
   data)
     for b in f435w f555w; do
       d=$ML/data/m32_sim_${b}_p128_common
-      [ -f "$d/val_observed.npy" ] && { echo "$d exists, skipping"; continue; }
+      c=$ML/config/m32_sim_${b}_p128_common.yaml
+      # "exists, skipping" is only safe if what exists was built with the
+      # constants the config NOW pins. Changing a pinned value and re-running
+      # otherwise skips silently and trains on the old encoding -- which is
+      # exactly the failure this whole change is about, and it bit me once
+      # already during development.
+      if [ -f "$d/val_observed.npy" ]; then
+        PYTHONPATH="$ML" "$PY" - "$d/norm.json" "$c" <<'EOF' || exit 1
+import json, sys, yaml
+norm = json.load(open(sys.argv[1]))
+cfg = yaml.safe_load(open(sys.argv[2]))["data"]
+bad = []
+for ch in ("observed", "ideal"):
+    for k in ("beta", "lo_s", "hi_s"):
+        want = cfg.get(f"{ch}_asinh_{k}")
+        if want is None:
+            continue
+        got = norm[ch][k]
+        if abs(float(got) - float(want)) > 1e-6 * max(1.0, abs(float(want))):
+            bad.append(f"    {ch}.{k}: on disk {got!r}, config pins {want!r}")
+if bad:
+    sys.exit("STALE DATASET -- built with different asinh constants:\n"
+             + "\n".join(bad)
+             + f"\n    Delete {sys.argv[1].rsplit('/',1)[0]} and re-run; do NOT "
+               "train on it.\n    (The two bands must share one map or the "
+               "trainer's load_dataset_norms will refuse anyway.)")
+print(f"    {sys.argv[1]}: constants match the config")
+EOF
+        echo "$d exists and matches, skipping"
+        continue
+      fi
       echo "--- building $d"
-      PYTHONPATH="$ML" "${DATA_CMD[@]}" "$ML/config/m32_sim_${b}_p128_common.yaml"
+      PYTHONPATH="$ML" "${DATA_CMD[@]}" "$c"
     done
     echo
     echo "Both norm.json must now differ ONLY in observed.median (the sky):"
@@ -87,11 +135,14 @@ case "${1:-show}" in
     done
     ;;
   train)
+    shift                     # drop "train"; anything left is passed THROUGH
     [ -f "$DB/val_observed.npy" ] && [ -f "$DV/val_observed.npy" ] || {
       echo "datasets missing -- run './train_twoband_common.sh data' first" >&2; exit 1; }
     "$PY" -c "import torch;print('torch',torch.__version__,'cuda',torch.cuda.is_available(),
               torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
-    PYTHONPATH="$ML" "${TRAIN_CMD[@]}"
+    # "$@" last so a caller can override any default above, e.g.
+    #   ./train_twoband_common.sh train --lr 1e-4
+    PYTHONPATH="$ML" "${TRAIN_CMD[@]}" "$@"
     ;;
   *)
     echo "Two-band joint prior on the shared asinh map"
@@ -100,6 +151,10 @@ case "${1:-show}" in
     echo "  out    $OUT"
     echo "  sky-aug flux offset [$SKY_LO, $SKY_HI] (re-solved for the common map)"
     echo "  ~11450 train pairs (5725 per band, naturally balanced)"
+    echo "  epochs  $EPOCHS  = the F555W run's gradient-step budget (5725x600),"
+    echo "          ~10.5 h at its measured 61.5 s per 5725-pair epoch"
+    echo "  NOTE the trainer has no --resume: a walltime kill loses the run."
+    echo "       Size -t from the line above, and copy best.pt off \$SCRATCH."
     echo
     printf '  %q ' "${TRAIN_CMD[@]}"; echo
     ;;
