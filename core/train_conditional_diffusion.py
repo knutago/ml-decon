@@ -810,7 +810,14 @@ def validate(model, loader, alpha_bar, device):
 
 
 def save_checkpoint(path, model, ema, ema_is_lib, optimizer, epoch,
-                    dataset_norm, args):
+                    dataset_norm, args, dataset_norms=None):
+    # dataset_norms is the per---data-dir list. It has to be PASSED, not read
+    # from an enclosing scope: this is a module-level function, so referencing
+    # main()'s local raised NameError at the first checkpoint write -- after a
+    # full epoch of GPU time, which is the worst place to put a typo. Defaulting
+    # to [dataset_norm] keeps any single-dataset caller working unchanged.
+    if dataset_norms is None:
+        dataset_norms = [dataset_norm] if dataset_norm is not None else None
     ckpt = {
         "epoch": epoch,
         "model_state": model.state_dict(),
@@ -1191,11 +1198,13 @@ def main():
               f"val {val_loss:.5f}  ({dt:.1f}s)")
 
         save_checkpoint(args.checkpoint_dir / "last.pt", model, ema,
-                        ema_is_lib, optimizer, epoch, dataset_norm, args)
+                        ema_is_lib, optimizer, epoch, dataset_norm, args,
+                        dataset_norms)
         if val_loss < best_val:
             best_val = val_loss
             save_checkpoint(args.checkpoint_dir / "best.pt", model, ema,
-                            ema_is_lib, optimizer, epoch, dataset_norm, args)
+                            ema_is_lib, optimizer, epoch, dataset_norm, args,
+                            dataset_norms)
             print(f"          -> new best val loss, saved best.pt")
 
     print(f"[done] best val loss {best_val:.5f}. Use the 'ema_state' weights "
