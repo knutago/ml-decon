@@ -48,6 +48,37 @@ else OUT=$ML/m32sim_arms/ckpt_m32sim_twoband_common; fi
 EPOCHS=${EPOCHS:-300}
 WORKERS=${WORKERS:-8}
 
+# T-MAX FOR THE TWO TRAINING TERMS -- raised from 100, and this is a consequence
+# of the shared map, not a free knob.
+#
+# Both terms exist to cover the t range the PnP prox actually calls the denoiser
+# in. Under the OLD per-band maps that was t <~ 75, so 100 covered it. The common
+# map rescaled the ideal z-domain by a DIFFERENT factor per band -- F435W's
+# target std went 0.0531 -> 0.0451 (0.849x), F555W's 0.0438 -> 0.0664 (1.518x) --
+# so a fixed sigma_z is now 1.18x too strong for B, 0.66x too weak for V, and the
+# useful range moved UP. Measured on the 2026-09-19 checkpoint (guidance_probe.py,
+# completeness against the sim truth):
+#
+#     F435W  t=75 0.77 | 90 0.85 | 100 0.85    <- saturated
+#     F555W  t=75 0.32 | 90 0.40 | 100 0.46    <- STILL CLIMBING at the ceiling
+#
+# F555W is clipped by t_max=100, and it cannot just be raised at inference: past
+# identity_t_max the fixed-point term was never trained and ||D(x)-x|| on true
+# patches blows up (0.216 at t=100, 46.6 at t=200). The ceiling has to move at
+# TRAINING time. That band asymmetry is what produced flux 1.544 (B) vs 0.931 (V)
+# = 0.55 mag of spurious colour, on the one axis this change was for.
+#
+# WATCH THE DILUTION. identity rows are spread over [0, T_ID), so doubling the
+# range halves the identity density per timestep at fixed IDENT_FRAC, and the
+# low-t oversampling likewise thins. Before trusting the next checkpoint, check
+# ||D(x)-x|| on true patches at t=50/100/150 with denoise_probe.py; if the
+# fixed-point behaviour is worse than this run's, raise IDENT_FRAC toward
+# 0.25-0.30 rather than putting T_ID back to 100.
+T_ID=${T_ID:-200}
+T_LOW=${T_LOW:-200}
+IDENT_FRAC=${IDENT_FRAC:-0.15}
+LOW_FRAC=${LOW_FRAC:-0.25}
+
 DB=$ML/data/m32_sim_f435w_p128_common
 DV=$ML/data/m32_sim_f555w_p128_common
 
@@ -82,10 +113,10 @@ TRAIN_CMD=("$PY" "$ML/core/train_conditional_diffusion.py"
   --dilations 1,2,3,4,6,8,6,4,3,2,1
   --norm none                     # GroupNorm destroys absolute scale at block 0
   --p-uncond 0.15                 # keeps the null token trained, so --guidance works
-  --identity-frac 0.15
-  --identity-t-max 100
-  --low-t-frac 0.25
-  --low-t-max 100
+  --identity-frac "$IDENT_FRAC"
+  --identity-t-max "$T_ID"
+  --low-t-frac "$LOW_FRAC"
+  --low-t-max "$T_LOW"
   --sky-aug
   --sky-aug-lo "$SKY_LO"
   --sky-aug-hi "$SKY_HI")
@@ -151,6 +182,8 @@ EOF
     echo "  out    $OUT"
     echo "  sky-aug flux offset [$SKY_LO, $SKY_HI] (re-solved for the common map)"
     echo "  ~11450 train pairs (5725 per band, naturally balanced)"
+    echo "  t-max   identity $T_ID  low-t $T_LOW  (raised from 100: the common map"
+    echo "          moved the useful range up and F555W was clipped at 100)"
     echo "  epochs  $EPOCHS  = the F555W run's gradient-step budget (5725x600),"
     echo "          ~10.5 h at its measured 61.5 s per 5725-pair epoch"
     echo "  NOTE the trainer has no --resume: a walltime kill loses the run."
