@@ -27,24 +27,44 @@ cd "$SLURM_SUBMIT_DIR"
 
 # --- adjust these to Vista's layout (same three as admm_tune.slurm) --------
 module load cuda || true
-export PY=${PY:-$WORK/conda/envs/py313/bin/python}
+# CORRECTED 2026-09-16: this defaulted to $WORK/conda/envs/py313/bin/python,
+# which does not exist on Vista -- that path is the LOCAL workstation's conda
+# env, copied into this file by hand and never adjusted. Vista's interpreter is
+# ml-decon's uv venv (cpython 3.12, aarch64). Checked below rather than left to
+# fail three lines later with a confusing traceback.
+export PY=${PY:-$WORK/ml-decon/.venv/bin/python}
 export ML_DECON=${ML_DECON:-$WORK/ml-decon}
 # --------------------------------------------------------------------------
+[ -x "$PY" ] || { echo "PY=$PY is not executable. On Vista the interpreter is
+  \$WORK/ml-decon/.venv/bin/python (a uv venv). Find it with:
+     ls -l \$WORK/ml-decon/.venv/bin/python
+  and re-submit with  PY=<that path> sbatch cmd_fullframe.slurm" >&2; exit 1; }
 
 export ITERS=${ITERS:-450}
 export CHUNK=${CHUNK:-32}     # a GH200 has the memory for wider chunks than CPU
-export OUT=${OUT:-cmd_bands_full}
+# PRIOR selects the arm; see run_cmd_fullframe.sh. TMAX is left unset on purpose
+# so the driver applies its per-prior default (188 for joint, 75 otherwise).
+export PRIOR=${PRIOR:-joint}
+export OUT=${OUT:-cmd_bands_full_$PRIOR}
 
-echo "host=$(hostname)  iters=$ITERS  chunk=$CHUNK  out=$OUT"
+echo "host=$(hostname)  prior=$PRIOR  iters=$ITERS  chunk=$CHUNK  out=$OUT"
 "$PY" -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
+./run_cmd_fullframe.sh          # print the resolved plan into the job log
 
 # The datasets are small and CPU-bound to build; do it here so the job is
-# self-contained, and it is a no-op if they already exist.
-[ -d "$ML_DECON/data/m32_full_f555w" ] || ./run_cmd_fullframe.sh data
+# self-contained, and it is a no-op if they already exist. The probe dir has to
+# be the one THIS prior uses -- checking the shared arm's dataset would skip the
+# build for every other arm and then fail in the solve.
+case "$PRIOR" in
+  joint) PROBE=m32_fullj_f555w ;;
+  *)     PROBE=m32_full_f555w ;;
+esac
+[ -d "$ML_DECON/data/$PROBE" ] || ./run_cmd_fullframe.sh data
 
 ./run_cmd_fullframe.sh solve
 
 echo
+case "$PRIOR" in joint) PFX=m32_fullj ;; *) PFX=m32_full ;; esac
 echo "Then, back on any machine:"
-echo "  python cmd_forced.py --run-dir $OUT --data-prefix m32_full --min-dchi2 470 --out-dir cmd_out_full_snr470"
-echo "  python cmd_quality_figure.py --run-dir $OUT --data-prefix m32_full"
+echo "  python cmd_forced.py --run-dir $OUT --data-prefix $PFX --min-dchi2 470 --out-dir cmd_out_${PRIOR}_snr470"
+echo "  python cmd_quality_figure.py --run-dir $OUT --data-prefix $PFX"
