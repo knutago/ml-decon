@@ -75,20 +75,38 @@ from red_pnp_deconvolve import TorchNorm, load_kernel, make_otf  # noqa: E402
 ML = Path(os.environ.get("ML_DECON", "/home/alex/noir_ml/global/ml-decon"))
 MY = Path(os.environ.get("MYCODE", Path(__file__).resolve().parent))
 
+def _find(name):
+    """Locate a FITS by name across the layouts this repo has used.
+
+    The m32 frames have been reorganised twice (flat in data/, then into
+    data/m32/, then into per-reference data/m32_l160/ and data/m32_l640/).
+    Hardcoding one layout means the next tidy-up breaks the pipeline with a
+    FileNotFoundError raised deep inside astropy. Search instead, and say
+    plainly which candidates were tried when nothing is found.
+    """
+    tried = [ML / sub / name for sub in
+             ("data/m32_l160", "data/m32_l640", "data", "data/m32")]
+    for c in tried:
+        if c.exists():
+            return c
+    raise SystemExit("cannot find %s; looked in:\n  %s"
+                     % (name, "\n  ".join(str(t) for t in tried)))
+
+
 # The measured band assignment above, as data. Each entry is a real HST frame
 # plus somebody else's deconvolution of that same frame.
 BANDS = {
     "f435w": dict(
-        observed=ML / "data/m32b_phase_v2ef.fits",
-        reference=ML / "data/m32b_phase_v2l160.fits",
+        observed=_find("m32b_phase_v2ef.fits"),
+        reference=_find("m32b_phase_v2l160.fits"),
         psf=MY / "psf_m32_v2_centred.fits",
         ckpt=ML / "checkpoints_cond_m32sim_f435w/best.pt",
         out=ML / "data/m32_band_f435w",
         photflam=5.3685924e-19, photzpt=-21.1, exptime=1279.0,
     ),
     "f555w": dict(
-        observed=ML / "data/m32_l640/m32v_phase_v2ef.fits",
-        reference=ML / "data/m32_l640/m32v_phase_v2l640.fits",
+        observed=_find("m32v_phase_v2ef.fits"),
+        reference=_find("m32v_phase_v2l640.fits"),
         psf=MY / "psf_m32v_v2_centred.fits",
         ckpt=ML / "checkpoints_cond_m32sim_f555w/best.pt",
         out=ML / "data/m32_band_f555w",
@@ -166,7 +184,33 @@ def main():
 
     # ---- background-statistics match into the checkpoint's observed domain --
     ck = torch.load(cfg["ckpt"], map_location="cpu", weights_only=False)
-    onp = ck["dataset_norm"]["observed"]
+    ck_norm = ck["dataset_norm"]
+    # MULTI-BAND CHECKPOINT: "dataset_norm" is only the FIRST --data-dir's. On
+    # the joint two-band prior that is F435W, so reading it for the F555W frame
+    # would normalize V into B's observed domain (median 207.17 vs 385.66, and a
+    # different beta) -- the encoding mismatch the common map exists to remove,
+    # reintroduced at dataset-build time and invisible afterwards. Every other
+    # consumer of these checkpoints already selects by band; this one did not.
+    #
+    # There is no data median to match against yet (we are BUILDING the data),
+    # so selection is by the band's name in the checkpoint's own data_dirs.
+    _l = ck.get("dataset_norms")
+    if _l and len(_l) > 1:
+        dirs = ck.get("data_dirs") or []
+        if len(dirs) != len(_l):
+            raise SystemExit(f"checkpoint has {len(_l)} norms but {len(dirs)} "
+                             "data_dirs -- cannot tell which belongs to "
+                             f"--band {args.band}")
+        hits = [i for i, d in enumerate(dirs) if args.band in Path(d).name]
+        if len(hits) != 1:
+            raise SystemExit(
+                f"--band {args.band} matches {len(hits)} of the checkpoint's "
+                f"data_dirs {[Path(d).name for d in dirs]} -- refusing to guess "
+                "which normalization this band should be built in")
+        ck_norm = _l[hits[0]]
+        print(f"[norm] multi-band checkpoint: --band {args.band} -> "
+              f"{Path(dirs[hits[0]]).name}")
+    onp = ck_norm["observed"]
     obs_norm = TorchNorm(onp)
     _, med_o, std_o = sigma_clipped_stats(obs_img, sigma=3.0, maxiters=5)
     a = float(onp["beta"]) / float(std_o)
